@@ -16,6 +16,8 @@
 
 set -e
 
+VERSION="0.1.0"
+
 # Auto-detect project directory: use CLEAN_PROJECT_DIR env var, or fall back
 # to ~/GitHub, ~/Projects, ~/repos, ~/src (first that exists).
 if [ -n "$CLEAN_PROJECT_DIR" ]; then
@@ -41,8 +43,13 @@ TOTAL_SIZE=0
 ACTIVE_WORKTREES=""
 
 # Parse arguments
+if [ "$1" = "--version" ] || [ "$1" = "-V" ]; then
+    echo "clean $VERSION"
+    exit 0
+fi
+
 if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
-    echo "clean — aggressive but safe disk cleanup for macOS dev machines"
+    echo "clean $VERSION — aggressive but safe disk cleanup for macOS dev machines"
     echo ""
     echo "Usage: clean [options]"
     echo ""
@@ -78,6 +85,7 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo ""
     echo "Options:"
     echo "  -h, --help         Show this help message"
+    echo "  -V, --version      Print version and exit"
     echo "  -c, --check        Check how much space would be freed (dry run)"
     echo "  -a, --aggressive   Also run 'docker system prune -af --volumes'"
     echo "  --system-only      Skip per-project cleanup (system caches only)"
