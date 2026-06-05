@@ -44,7 +44,7 @@ ACTIVE_WORKTREES=""
 if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "clean — aggressive but safe disk cleanup for macOS dev machines"
     echo ""
-    echo "Usage: cleanup [options]"
+    echo "Usage: clean [options]"
     echo ""
     echo "Designed for developers working with lots of git worktrees."
     echo ""
@@ -87,10 +87,10 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "                     ~/GitHub, ~/Projects, ~/repos, ~/src)"
     echo ""
     echo "Examples:"
-    echo "  cleanup                              # Run cleanup"
-    echo "  cleanup --check                      # Preview what would be cleaned"
-    echo "  cleanup --aggressive                 # Include destructive Docker prune"
-    echo "  CLEAN_PROJECT_DIR=~/code cleanup     # Custom project directory"
+    echo "  clean                              # Run cleanup"
+    echo "  clean --check                      # Preview what would be cleaned"
+    echo "  clean --aggressive                 # Include destructive Docker prune"
+    echo "  CLEAN_PROJECT_DIR=~/code clean     # Custom project directory"
     exit 0
 fi
 
@@ -449,7 +449,8 @@ echo ""
 # Python caches — recursive, but only old + outside active worktrees + outside venv site-packages
 echo "🐍 Python caches (__pycache__, .pytest_cache, .ruff_cache, .mypy_cache) >$PYCACHE_AGE_DAYS days..."
 find "$PROJECT_DIR" \
-    \( -path "*/site-packages/*" -o -path "*/.venv/*" -o -path "*/venv/*" -o -path "*/.dev-venv/*" -o -path "*/node_modules/*" \) -prune \
+    \( -name "site-packages" -o -name ".venv" -o -name "venv" -o -name ".dev-venv" \
+       -o -name "node_modules" -o -name ".loom" -o -name ".claude" \) -prune \
     -o \( -name "__pycache__" -o -name ".pytest_cache" -o -name ".ruff_cache" -o -name ".mypy_cache" \) \
     -type d -print 2>/dev/null | while read dir; do
     if is_in_active_worktree "$dir"; then continue; fi
@@ -461,7 +462,8 @@ echo ""
 # Stray .pyc files outside __pycache__ dirs (legacy Python 2 / odd toolchains)
 echo "🐍 Stray .pyc files >$PYCACHE_AGE_DAYS days..."
 find "$PROJECT_DIR" \
-    \( -path "*/site-packages/*" -o -path "*/.venv/*" -o -path "*/venv/*" -o -path "*/__pycache__/*" -o -path "*/node_modules/*" \) -prune \
+    \( -name "site-packages" -o -name ".venv" -o -name "venv" -o -name "__pycache__" \
+       -o -name "node_modules" -o -name ".loom" -o -name ".claude" \) -prune \
     -o -name "*.pyc" -type f -mtime +$PYCACHE_AGE_DAYS -print 2>/dev/null \
     | while read f; do
         if is_in_active_worktree "$f"; then continue; fi
@@ -472,7 +474,8 @@ echo ""
 # Old Python virtual environments
 echo "🐍 Python virtual environments (>$VENV_AGE_DAYS days old, root + subdirs)..."
 find "$PROJECT_DIR" \
-    \( -path "*/node_modules/*" -o -path "*/site-packages/*" -o -path "*/target/*" \) -prune \
+    \( -name "node_modules" -o -name "site-packages" -o -name "target" \
+       -o -name ".loom" -o -name ".claude" \) -prune \
     -o \( -name "venv" -o -name ".venv" -o -name ".dev-venv" -o -name "env" \) -type d -print 2>/dev/null \
     | while read venv_path; do
     if [ "$(basename "$venv_path")" = "env" ] && [ ! -f "$venv_path/bin/python" ]; then
@@ -492,7 +495,8 @@ echo ""
 # Rust target directories — recursive for monorepos
 echo "🦀 Rust build caches (target/) >$TARGET_AGE_DAYS days, root + monorepo subdirs..."
 find "$PROJECT_DIR" \
-    \( -path "*/target/*" -o -path "*/vendor/*" -o -path "*/.venv/*" -o -path "*/venv/*" -o -path "*/node_modules/*" \) -prune \
+    \( -name "target" -o -name "vendor" -o -name ".venv" -o -name "venv" \
+       -o -name "node_modules" -o -name ".loom" -o -name ".claude" \) -prune \
     -o -name "Cargo.toml" -type f -print 2>/dev/null \
     | while read cargo_toml; do
         crate_dir="$(dirname "$cargo_toml")"
@@ -679,7 +683,7 @@ if [ "$CHECK_MODE" = true ]; then
     df -h / | tail -1 | awk '{print "  Used: " $3 " / " $2 " (" $5 ")"}'
     echo "  Available: $(df -h / | tail -1 | awk '{print $4}')"
     echo ""
-    echo "Run 'cleanup' without --check to free this space"
+    echo "Run 'clean' without --check to free this space"
 else
     echo "✅ Cleanup complete!"
     echo "═══════════════════════════════════════════════════════════"
