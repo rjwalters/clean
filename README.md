@@ -41,19 +41,24 @@ Cleans system caches, Docker resources, per-project build artifacts, and stale w
 
 ```bash
 git clone https://github.com/rjwalters/clean.git ~/GitHub/clean
-
-# Symlink to PATH
-ln -s ~/GitHub/clean/cleanup.sh /usr/local/bin/cleanup
+cd ~/GitHub/clean
+./install.sh
 ```
+
+The installer symlinks `clean` into `/usr/local/bin` (or `~/.local/bin` if that's not writable). Re-run `./install.sh` anytime to repair or move the install — it's idempotent.
+
+To update, just `git pull` in the repo. The symlink keeps pointing at the live script, so no reinstall is needed.
+
+To uninstall: `./install.sh --uninstall`.
 
 ## Usage
 
 ```bash
-cleanup              # Run cleanup
-cleanup --check      # Preview what would be cleaned (dry run)
-cleanup --aggressive # Also run 'docker system prune -af --volumes'
-cleanup --system-only # Skip per-project cleanup
-cleanup --help       # Show detailed help
+clean              # Run cleanup
+clean --check      # Preview what would be cleaned (dry run)
+clean --aggressive # Also run 'docker system prune -af --volumes'
+clean --system-only # Skip per-project cleanup
+clean --help       # Show detailed help
 ```
 
 ## Project directory
@@ -68,7 +73,7 @@ The script auto-detects your project directory by checking (in order):
 
 Override with:
 ```bash
-CLEAN_PROJECT_DIR=~/code cleanup
+CLEAN_PROJECT_DIR=~/code clean
 ```
 
 ## Configuration
