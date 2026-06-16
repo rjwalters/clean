@@ -36,6 +36,7 @@ VENV_AGE_DAYS=7
 TMP_AGE_HOURS=1              # /tmp clones must be at least this old
 PYCACHE_AGE_DAYS=14          # __pycache__ etc must be at least this old
 TARGET_AGE_DAYS=7            # rust target dirs must be at least this old
+WORKTREE_AGE_DAYS=14         # non-issue agent worktrees must be at least this old
 CHECK_MODE=false
 AGGRESSIVE_MODE=false
 SYSTEM_ONLY=false
@@ -72,7 +73,9 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "  • git gc --auto + git worktree prune"
     echo ""
     echo "Worktree cleanup (requires gh CLI):"
-    echo "  • Worktrees for closed GitHub issues (.loom/worktrees/issue-*)"
+    echo "  • Worktrees for closed GitHub issues (.loom/worktrees/issue-*, .claude/worktrees/issue-*)"
+    echo "  • Stale agent-workflow worktrees (.loom/worktrees/*, .claude/worktrees/*) >$WORKTREE_AGE_DAYS days"
+    echo "    — only if clean (no uncommitted/unpushed work) and no live process"
     echo "  • Feature branches for closed issues (feature/issue-*)"
     echo "  • Loom tmux sessions (loom-*)"
     echo ""
@@ -395,36 +398,34 @@ fi
 echo ""
 
 # Stale /tmp clones from dev tool sessions (PR reviews, issue work, etc.)
-# Safety: age check + lsof + worktree check
+# Detected structurally: any /private/tmp/<dir>/ that is a git repo.
+# `.git` may be a directory (regular clone) OR a file (`git worktree add` writes
+# `.git` as a file containing `gitdir: <path>`), so check existence — not type.
+# Safety: age check + lsof + worktree check.
 echo "🗑️  Cleaning stale /tmp clones (>$TMP_AGE_HOURS h old, no open handles)..."
-TMP_PATTERNS=(
-    "/private/tmp/pr-*"
-    "/private/tmp/pr[0-9]*"
-    "/private/tmp/issue-*"
-    "/private/tmp/repo-pr-*"
-)
-for pattern in "${TMP_PATTERNS[@]}"; do
-    for d in $pattern; do
-        [ -d "$d" ] || continue
+for d in /private/tmp/*/; do
+    d="${d%/}"
+    [ -d "$d" ] || continue
+    [ -e "$d/.git" ] || continue
+    git -C "$d" rev-parse --git-dir >/dev/null 2>&1 || continue
 
-        if ! is_older_than_hours "$d" $TMP_AGE_HOURS; then
-            echo "  [SKIP too new] $d"
-            continue
-        fi
+    if ! is_older_than_hours "$d" $TMP_AGE_HOURS; then
+        echo "  [SKIP too new] $d"
+        continue
+    fi
 
-        if is_in_active_worktree "$d"; then
-            echo "  [SKIP active worktree] $d"
-            continue
-        fi
+    if is_in_active_worktree "$d"; then
+        echo "  [SKIP active worktree] $d"
+        continue
+    fi
 
-        if has_open_handles "$d"; then
-            echo "  [SKIP open handles] $d"
-            continue
-        fi
+    if has_open_handles "$d"; then
+        echo "  [SKIP open handles] $d"
+        continue
+    fi
 
-        size=$(get_size "$d")
-        remove_item "$d" "stale tmp ($size)"
-    done
+    size=$(get_size "$d")
+    remove_item "$d" "stale tmp ($size)"
 done
 echo ""
 
@@ -554,11 +555,13 @@ done
 echo ""
 
 # =============================================================================
-# WORKTREE CLEANUP — clean worktrees and branches for closed GitHub issues
+# WORKTREE CLEANUP — clean worktrees and branches for closed GitHub issues,
+# plus stale agent-workflow worktrees (audit-*, mechanic-*, researcher-*, …)
+# under .loom/worktrees/ and .claude/worktrees/.
 # =============================================================================
 
 echo "═══════════════════════════════════════════════════════════"
-echo "              WORKTREE CLEANUP (closed issues)"
+echo "              WORKTREE CLEANUP"
 echo "═══════════════════════════════════════════════════════════"
 echo ""
 
@@ -573,6 +576,48 @@ wt_skipped=0
 br_cleaned=0
 tmux_cleaned=0
 
+# Decide whether a non-issue worktree is safe to remove.
+# Returns 0 (true) if all safety checks pass; prints the reason and returns 1 otherwise.
+# Args: $1 = project_name, $2 = worktree_dir, $3 = display_label
+worktree_is_stale_and_safe() {
+    local pname="$1"
+    local wt="$2"
+    local label="$3"
+
+    if ! is_older_than_days "$wt" $WORKTREE_AGE_DAYS; then
+        echo "  [KEEP too new] $pname $label"
+        return 1
+    fi
+
+    if is_in_active_worktree "$wt"; then
+        echo "  [SKIP active] $pname $label"
+        return 1
+    fi
+
+    if has_open_handles "$wt"; then
+        echo "  [SKIP open handles] $pname $label"
+        return 1
+    fi
+
+    if ! git -C "$wt" diff --quiet 2>/dev/null || \
+       ! git -C "$wt" diff --cached --quiet 2>/dev/null; then
+        echo "  [SKIP uncommitted] $pname $label"
+        return 1
+    fi
+
+    # If branch has an upstream and unpushed commits, preserve it.
+    if git -C "$wt" rev-parse '@{u}' >/dev/null 2>&1; then
+        local unpushed
+        unpushed=$(git -C "$wt" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+        if [ "$unpushed" -gt 0 ]; then
+            echo "  [SKIP $unpushed unpushed] $pname $label"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 for project in "$PROJECT_DIR"/*; do
     [ -d "$project/.git" ] || continue
 
@@ -580,48 +625,61 @@ for project in "$PROJECT_DIR"/*; do
     has_worktrees=false
     has_branches=false
 
-    # Clean worktrees for closed issues (.loom/worktrees/issue-*)
-    if [ -d "$project/.loom/worktrees" ]; then
-        for worktree_dir in "$project"/.loom/worktrees/issue-*; do
+    # Walk every subdir under .loom/worktrees/ and .claude/worktrees/.
+    # issue-N dirs use the closed-issue check; everything else uses age-based safety.
+    for worktree_root in "$project/.loom/worktrees" "$project/.claude/worktrees"; do
+        [ -d "$worktree_root" ] || continue
+        for worktree_dir in "$worktree_root"/*; do
             [ -d "$worktree_dir" ] || continue
             has_worktrees=true
 
-            issue_num=$(basename "$worktree_dir" | sed 's/issue-//')
-            if ! echo "$issue_num" | grep -q '^[0-9]\+$'; then
-                continue
-            fi
+            wt_name=$(basename "$worktree_dir")
+            root_tag=$(basename "$(dirname "$worktree_root")")/$(basename "$worktree_root")
+            label="$root_tag/$wt_name"
 
-            # Check issue state via GitHub CLI
-            issue_state=$(cd "$project" && gh issue view "$issue_num" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
+            if echo "$wt_name" | grep -qE '^issue-[0-9]+$'; then
+                # Issue worktree: only remove if the corresponding issue is CLOSED,
+                # then run the same safety checks the broader walk uses.
+                issue_num="${wt_name#issue-}"
+                issue_state=$(cd "$project" && gh issue view "$issue_num" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
 
-            if [ "$issue_state" != "CLOSED" ]; then
-                echo "  [KEEP] $project_name issue-$issue_num ($issue_state)"
-                wt_skipped=$((wt_skipped + 1))
-                continue
-            fi
+                if [ "$issue_state" != "CLOSED" ]; then
+                    echo "  [KEEP] $project_name $label ($issue_state)"
+                    wt_skipped=$((wt_skipped + 1))
+                    continue
+                fi
 
-            # Check for uncommitted changes
-            if git -C "$worktree_dir" diff --quiet 2>/dev/null && \
-               git -C "$worktree_dir" diff --cached --quiet 2>/dev/null; then
-                : # clean
+                if ! git -C "$worktree_dir" diff --quiet 2>/dev/null || \
+                   ! git -C "$worktree_dir" diff --cached --quiet 2>/dev/null; then
+                    echo "  [SKIP uncommitted] $project_name $label"
+                    wt_skipped=$((wt_skipped + 1))
+                    continue
+                fi
+
+                if is_in_active_worktree "$worktree_dir"; then
+                    echo "  [SKIP active] $project_name $label"
+                    wt_skipped=$((wt_skipped + 1))
+                    continue
+                fi
+
+                echo "  [CLOSED] $project_name $label"
             else
-                echo "  [SKIP uncommitted] $project_name issue-$issue_num"
-                wt_skipped=$((wt_skipped + 1))
-                continue
+                if ! worktree_is_stale_and_safe "$project_name" "$worktree_dir" "$label"; then
+                    wt_skipped=$((wt_skipped + 1))
+                    continue
+                fi
+                echo "  [STALE] $project_name $label"
             fi
 
-            echo "  [CLOSED] $project_name issue-$issue_num"
             if [ "$CHECK_MODE" = false ]; then
                 worktree_abs="$(cd "$worktree_dir" && pwd)"
                 (cd "$project" && git worktree remove "$worktree_abs" --force 2>/dev/null) || \
                     rm -rf "$worktree_dir" 2>/dev/null
                 echo "    ✓ Removed worktree"
-                wt_cleaned=$((wt_cleaned + 1))
-            else
-                wt_cleaned=$((wt_cleaned + 1))
             fi
+            wt_cleaned=$((wt_cleaned + 1))
         done
-    fi
+    done
 
     # Clean feature branches for closed issues (feature/issue-*)
     branches=$(cd "$project" && git branch 2>/dev/null | grep "feature/issue-" | sed 's/^[*+ ]*//' || true)

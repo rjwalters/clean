@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Broader worktree cleanup** (#1) — `.loom/worktrees/` and `.claude/worktrees/` are now both walked, every subdir (not just `issue-*`). Non-issue agent worktrees (`audit-*`, `mechanic-*`, `researcher-*`, `agent-*`, …) are removed once they're older than `WORKTREE_AGE_DAYS` (default 14) and have no uncommitted changes, no unpushed commits, no live process, and aren't inside an active worktree. Existing `issue-N` CLOSED-issue logic is preserved.
+- **Structural `/tmp` clone detection** (#1) — replaces the fixed `pr-*`/`issue-*` name list with "any `/private/tmp/<dir>/` that is a git repo", so `<repo-name>-<number>` / `<repo-name>-<descriptor>` clones from `gh pr checkout`-style tooling are cleaned without enumerating naming schemes. Handles `.git` as either a directory (regular clone) or a file (`git worktree add`).
+
 ## [0.1.0] - 2026-06-05
 
 Initial tagged release.
