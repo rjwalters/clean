@@ -599,8 +599,9 @@ worktree_is_stale_and_safe() {
         return 1
     fi
 
-    if ! git -C "$wt" diff --quiet 2>/dev/null || \
-       ! git -C "$wt" diff --cached --quiet 2>/dev/null; then
+    # Use `git status --porcelain` so untracked files block removal too;
+    # `git diff` only inspects tracked-file changes.
+    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
         echo "  [SKIP uncommitted] $pname $label"
         return 1
     fi
@@ -649,8 +650,9 @@ for project in "$PROJECT_DIR"/*; do
                     continue
                 fi
 
-                if ! git -C "$worktree_dir" diff --quiet 2>/dev/null || \
-                   ! git -C "$worktree_dir" diff --cached --quiet 2>/dev/null; then
+                # Use `git status --porcelain` so untracked files block removal too;
+                # `git diff` only inspects tracked-file changes.
+                if [ -n "$(cd "$worktree_dir" && git status --porcelain 2>/dev/null)" ]; then
                     echo "  [SKIP uncommitted] $project_name $label"
                     wt_skipped=$((wt_skipped + 1))
                     continue
