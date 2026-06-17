@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-16
+
 ### Added
 
 - **Broader worktree cleanup** (#1) — `.loom/worktrees/` and `.claude/worktrees/` are now both walked, every subdir (not just `issue-*`). Non-issue agent worktrees (`audit-*`, `mechanic-*`, `researcher-*`, `agent-*`, …) are removed once they're older than `WORKTREE_AGE_DAYS` (default 14) and have no uncommitted changes, no unpushed commits, no live process, and aren't inside an active worktree. Existing `issue-N` CLOSED-issue logic is preserved.

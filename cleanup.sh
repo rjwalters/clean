@@ -16,7 +16,7 @@
 
 set -e
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # Auto-detect project directory: use CLEAN_PROJECT_DIR env var, or fall back
 # to ~/GitHub, ~/Projects, ~/repos, ~/src (first that exists).
