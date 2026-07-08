@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-08
+
+Stops every known path by which `clean` could delete active work-in-progress
+(observed repeatedly against lean-genius agent worktrees, which drove agents to
+park worktrees under `$HOME` where no janitor manages them).
+
+### Fixed
+
+- **Staleness is now recursive activity, not root-dir mtime** — a directory's
+  own mtime only changes when a direct child is added/removed/renamed, so a
+  worktree being actively edited deep in its tree looked "stale" once the root
+  dir passed the age threshold. Both the worktree pass (`WORKTREE_AGE_DAYS`)
+  and the `/tmp` clone pass (`TMP_AGE_HOURS`) now use `find -mtime/-mmin
+  -print -quit` over the whole tree (including `.git`, so commits/fetches count
+  as activity).
+- **`/tmp` clone cleanup now runs WIP checks** — previously a 1-hour-old
+  scratch clone/worktree was `rm -rf`'d with **no** uncommitted/unpushed check
+  at all. It now keeps anything with uncommitted/untracked files or commits not
+  on a remote, and removes registered worktrees via `git worktree remove`
+  (parent repo metadata stays consistent) instead of `rm -rf`.
+- **Unpushed detection no longer requires an upstream** — a branch with
+  local-only commits and no upstream configured (the standard agent-worktree
+  state) previously skipped the unpushed check entirely and was deleted. With
+  no upstream, HEAD must now be reachable from some remote ref, else the
+  worktree is preserved.
+- **No more `git worktree remove --force … || rm -rf` fallback** — if git
+  refuses the removal (e.g. files appeared between our safety checks and the
+  removal), the worktree is left in place for a future run instead of being
+  force-deleted. Plain `rm -rf` is reserved for dirs that are not registered
+  worktrees and have already passed the WIP checks; dirs that are not git
+  trees at all (residue of a lost worktree registration) are always preserved
+  and reported.
+- **Active-worktree guard is symlink-safe** — worktree paths and candidate
+  paths are normalized with `pwd -P`, so `/tmp` vs `/private/tmp` aliasing can
+  no longer defeat the guard.
+- **Unstatable dirs are kept, not deleted** — `is_older_than_days/hours`
+  treated a failed `stat` as "infinitely old" (eligible for deletion); they now
+  err on the side of keeping.
+- **In-repo worktree cleanup was inert** — the `is_in_active_worktree` gate
+  matched the main checkout's path prefix for every `.loom/worktrees/*` /
+  `.claude/worktrees/*` candidate (they live inside the main checkout), so the
+  pass never removed anything. The gate is replaced by the real protections
+  (recursive activity + open handles + WIP), and the closed-issue path gains
+  the same open-handle and unpushed guards.
+
 ## [0.2.0] - 2026-06-16
 
 ### Added
