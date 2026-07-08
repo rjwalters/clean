@@ -8,15 +8,20 @@
 #
 # Safety nets:
 #   1. Age thresholds — never delete files modified within N days
+#      (recursive for git trees: activity anywhere in the tree counts)
 #   2. Open-handle check (lsof) — never delete dirs with active processes
-#   3. Active worktree check — never delete inside live git worktrees
-#   4. GitHub issue check — only clean worktrees for CLOSED issues
-#   5. Tool-native commands (cargo clean, uv cache prune) over rm -rf
-#   6. Pattern matching — only known cache/temp patterns, never source
+#   3. Active worktree check (symlink-safe) — never delete inside live worktrees
+#   4. WIP check — never delete uncommitted or unpushed git work, including
+#      commits on branches that have no upstream configured
+#   5. GitHub issue check — only clean issue worktrees for CLOSED issues
+#   6. Tool-native commands (cargo clean, uv cache prune) over rm -rf;
+#      registered worktrees removed via `git worktree remove` (no --force,
+#      no rm -rf fallback) so git can veto if state changed under us
+#   7. Pattern matching — only known cache/temp patterns, never source
 
 set -e
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 # Auto-detect project directory: use CLEAN_PROJECT_DIR env var, or fall back
 # to ~/GitHub, ~/Projects, ~/repos, ~/src (first that exists).
@@ -60,7 +65,7 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "  • Homebrew, npm, pnpm, pip, bun, uv caches"
     echo "  • HuggingFace cache (info only — interactive cleanup recommended)"
     echo "  • Docker (containers >24h old, dangling images, unused volumes, build cache)"
-    echo "  • Stale /tmp clones (>$TMP_AGE_HOURS h, no open handles)"
+    echo "  • Stale /tmp clones (>$TMP_AGE_HOURS h idle, no open handles, no uncommitted/unpushed work)"
     echo "  • VS Code extension caches"
     echo "  • System logs >30 days old"
     echo ""
@@ -74,17 +79,21 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo ""
     echo "Worktree cleanup (requires gh CLI):"
     echo "  • Worktrees for closed GitHub issues (.loom/worktrees/issue-*, .claude/worktrees/issue-*)"
-    echo "  • Stale agent-workflow worktrees (.loom/worktrees/*, .claude/worktrees/*) >$WORKTREE_AGE_DAYS days"
-    echo "    — only if clean (no uncommitted/unpushed work) and no live process"
+    echo "  • Stale agent-workflow worktrees (.loom/worktrees/*, .claude/worktrees/*)"
+    echo "    — only if idle >$WORKTREE_AGE_DAYS days (recursive — activity anywhere in the"
+    echo "    tree counts), clean, fully on a remote (unpushed commits kept even with"
+    echo "    no upstream configured), and no live process"
     echo "  • Feature branches for closed issues (feature/issue-*)"
     echo "  • Loom tmux sessions (loom-*)"
     echo ""
     echo "Safety nets:"
-    echo "  • Age thresholds (configurable at top of script)"
+    echo "  • Age thresholds (recursive for git trees; configurable at top of script)"
     echo "  • Open-handle check via lsof (skips dirs with active processes)"
-    echo "  • Active worktree check (never touches files inside live worktrees)"
-    echo "  • GitHub issue status check (only cleans worktrees for CLOSED issues)"
-    echo "  • Tool-native commands when possible (cargo clean, uv cache prune)"
+    echo "  • Active worktree check, symlink-safe (never touches files inside live worktrees)"
+    echo "  • WIP check (never deletes uncommitted or unpushed git work)"
+    echo "  • GitHub issue status check (only cleans issue worktrees for CLOSED issues)"
+    echo "  • Tool-native commands when possible (cargo clean, uv cache prune);"
+    echo "    registered worktrees removed via git worktree remove, never rm -rf"
     echo ""
     echo "Options:"
     echo "  -h, --help         Show this help message"
@@ -157,7 +166,9 @@ is_older_than_days() {
     local dir="$1"
     local days="$2"
     local current_time=$(date +%s)
-    local dir_time=$(stat -f %m "$dir" 2>/dev/null || echo 0)
+    local dir_time=$(stat -f %m "$dir" 2>/dev/null || echo "")
+    # Unstatable ⇒ err on the side of "not old enough to delete"
+    [ -n "$dir_time" ] || return 1
     local threshold_seconds=$(( days * 86400 ))
     local age_seconds=$(( current_time - dir_time ))
     [ $age_seconds -gt $threshold_seconds ]
@@ -168,10 +179,61 @@ is_older_than_hours() {
     local dir="$1"
     local hours="$2"
     local current_time=$(date +%s)
-    local dir_time=$(stat -f %m "$dir" 2>/dev/null || echo 0)
+    local dir_time=$(stat -f %m "$dir" 2>/dev/null || echo "")
+    [ -n "$dir_time" ] || return 1
     local threshold_seconds=$(( hours * 3600 ))
     local age_seconds=$(( current_time - dir_time ))
     [ $age_seconds -gt $threshold_seconds ]
+}
+
+# Recursive activity check. A directory's own mtime only changes when a DIRECT
+# child is added/removed/renamed — editing files deeper in the tree does not
+# bump it, so root-mtime-only staleness flags actively-used worktrees as
+# "stale". These return 0 (true) if ANYTHING in the tree (including .git —
+# commits and fetches count as activity) was modified within the window.
+# -print -quit exits on the first recent path found, so live trees are cheap.
+has_recent_activity_days() {
+    local dir="$1"
+    local days="$2"
+    [ -n "$(find "$dir" -mtime -"$days" -print -quit 2>/dev/null)" ]
+}
+
+has_recent_activity_hours() {
+    local dir="$1"
+    local hours="$2"
+    [ -n "$(find "$dir" -mmin -"$(( hours * 60 ))" -print -quit 2>/dev/null)" ]
+}
+
+# Returns 0 (true) if the git repo/worktree at $1 holds work that exists
+# nowhere else: uncommitted/untracked files, commits ahead of upstream, or —
+# when no upstream is configured (the norm for agent scratch worktrees) — a
+# HEAD that no remote ref contains. Non-git dirs report "has WIP" so callers
+# preserve them.
+has_unpushed_work() {
+    local wt="$1"
+
+    if ! git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+        return 0
+    fi
+
+    if git -C "$wt" rev-parse --verify --quiet '@{u}' >/dev/null 2>&1; then
+        local unpushed
+        unpushed=$(git -C "$wt" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 1)
+        [ "${unpushed:-1}" -gt 0 ] && return 0
+    else
+        # No upstream: HEAD must be reachable from SOME remote ref, else the
+        # commits only exist locally. (grep-free: head -1 of the containment
+        # list; `|| true` guards set -e when HEAD is on no remote ref.)
+        local on_remote
+        on_remote=$(git -C "$wt" branch -r --contains HEAD 2>/dev/null | head -1) || true
+        [ -z "$on_remote" ] && return 0
+    fi
+
+    return 1
 }
 
 # Safety: check if any process has open file handles in this directory.
@@ -186,6 +248,8 @@ has_open_handles() {
 
 # Build a global list of all active git worktrees across all repos.
 # Used as a safety guard so we never delete files inside a live worktree.
+# Paths are normalized to physical form (pwd -P) so symlink aliases like
+# /tmp vs /private/tmp can't defeat the guard.
 discover_active_worktrees() {
     [ -n "$PROJECT_DIR" ] || return
     local repos="$PROJECT_DIR"/*/.git
@@ -194,18 +258,28 @@ discover_active_worktrees() {
         local repo_dir="$(dirname "$repo")"
         local wts=$(cd "$repo_dir" && git worktree list --porcelain 2>/dev/null \
                     | awk '/^worktree / {print substr($0,10)}')
-        ACTIVE_WORKTREES+="$wts"$'\n'
+        local wt
+        while IFS= read -r wt; do
+            [ -n "$wt" ] || continue
+            wt="$(cd "$wt" 2>/dev/null && pwd -P || echo "$wt")"
+            ACTIVE_WORKTREES+="$wt"$'\n'
+        done <<< "$wts"
     done
 }
 
 # Returns 0 (true) if $path is inside any active worktree.
+# With a second arg "allow-self", an exact match with a worktree root does NOT
+# count — used when evaluating a worktree itself for removal, where only
+# containment in a DIFFERENT worktree should block.
 is_in_active_worktree() {
     local path="$1"
-    local abs="$(cd "$(dirname "$path")" 2>/dev/null && pwd)/$(basename "$path")"
+    local allow_self="${2:-}"
+    local abs="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)/$(basename "$path")"
     while IFS= read -r wt; do
         [ -z "$wt" ] && continue
         case "$abs" in
-            "$wt"|"$wt"/*) return 0 ;;
+            "$wt") [ "$allow_self" = "allow-self" ] || return 0 ;;
+            "$wt"/*) return 0 ;;
         esac
     done <<< "$ACTIVE_WORKTREES"
     return 1
@@ -401,21 +475,25 @@ echo ""
 # Detected structurally: any /private/tmp/<dir>/ that is a git repo.
 # `.git` may be a directory (regular clone) OR a file (`git worktree add` writes
 # `.git` as a file containing `gitdir: <path>`), so check existence — not type.
-# Safety: age check + lsof + worktree check.
-echo "🗑️  Cleaning stale /tmp clones (>$TMP_AGE_HOURS h old, no open handles)..."
+# Safety: RECURSIVE idle check + lsof + worktree containment + never delete
+# uncommitted or unpushed work (a 1-hour threshold on the root mtime alone
+# deleted live agent worktrees whose deep files were being edited).
+echo "🗑️  Cleaning stale /tmp clones (>$TMP_AGE_HOURS h idle, no open handles, no WIP)..."
 for d in /private/tmp/*/; do
     d="${d%/}"
     [ -d "$d" ] || continue
     [ -e "$d/.git" ] || continue
     git -C "$d" rev-parse --git-dir >/dev/null 2>&1 || continue
 
-    if ! is_older_than_hours "$d" $TMP_AGE_HOURS; then
-        echo "  [SKIP too new] $d"
+    if has_recent_activity_hours "$d" $TMP_AGE_HOURS; then
+        echo "  [SKIP recent activity] $d"
         continue
     fi
 
-    if is_in_active_worktree "$d"; then
-        echo "  [SKIP active worktree] $d"
+    # A dir nested inside a DIFFERENT live worktree is not ours to touch; an
+    # exact match means $d is itself a registered worktree — handled below.
+    if is_in_active_worktree "$d" allow-self; then
+        echo "  [SKIP inside active worktree] $d"
         continue
     fi
 
@@ -424,8 +502,30 @@ for d in /private/tmp/*/; do
         continue
     fi
 
-    size=$(get_size "$d")
-    remove_item "$d" "stale tmp ($size)"
+    # Never delete work that exists nowhere else.
+    if has_unpushed_work "$d"; then
+        echo "  [KEEP uncommitted/unpushed] $d"
+        continue
+    fi
+
+    if [ -f "$d/.git" ]; then
+        # Linked worktree (`.git` is a gitdir pointer file): remove via git so
+        # the parent repo's metadata stays consistent. No --force and no rm -rf
+        # fallback — if git refuses (state changed since our checks), keep it.
+        size=$(get_size "$d")
+        echo "  [stale tmp worktree] $d ($size)"
+        if [ "$CHECK_MODE" = false ]; then
+            main_wt=$(git -C "$d" worktree list --porcelain 2>/dev/null \
+                      | awk '/^worktree / {print substr($0,10); exit}')
+            if [ -n "$main_wt" ] && (cd "$main_wt" 2>/dev/null && git worktree remove "$(cd "$d" && pwd -P)" 2>/dev/null); then
+                echo "    ✓ Removed"
+            else
+                echo "    ⚠️  git worktree remove refused — left in place"
+            fi
+        fi
+    else
+        remove_item "$d" "stale tmp clone"
+    fi
 done
 echo ""
 
@@ -579,18 +679,19 @@ tmux_cleaned=0
 # Decide whether a non-issue worktree is safe to remove.
 # Returns 0 (true) if all safety checks pass; prints the reason and returns 1 otherwise.
 # Args: $1 = project_name, $2 = worktree_dir, $3 = display_label
+#
+# Note: no is_in_active_worktree gate here — these dirs live INSIDE the main
+# checkout by path, so that check matched the main worktree's prefix and made
+# this whole pass inert. The real protection is activity + WIP below.
 worktree_is_stale_and_safe() {
     local pname="$1"
     local wt="$2"
     local label="$3"
 
-    if ! is_older_than_days "$wt" $WORKTREE_AGE_DAYS; then
-        echo "  [KEEP too new] $pname $label"
-        return 1
-    fi
-
-    if is_in_active_worktree "$wt"; then
-        echo "  [SKIP active] $pname $label"
+    # Recursive: editing files deep in the tree doesn't bump the root mtime,
+    # so root-mtime-only staleness would flag actively-used worktrees.
+    if has_recent_activity_days "$wt" $WORKTREE_AGE_DAYS; then
+        echo "  [KEEP recent activity] $pname $label"
         return 1
     fi
 
@@ -599,21 +700,11 @@ worktree_is_stale_and_safe() {
         return 1
     fi
 
-    # Use `git status --porcelain` so untracked files block removal too;
-    # `git diff` only inspects tracked-file changes.
-    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
-        echo "  [SKIP uncommitted] $pname $label"
+    # Never delete work that exists nowhere else: uncommitted/untracked files,
+    # or commits (with or without an upstream) that no remote ref contains.
+    if has_unpushed_work "$wt"; then
+        echo "  [KEEP uncommitted/unpushed] $pname $label"
         return 1
-    fi
-
-    # If branch has an upstream and unpushed commits, preserve it.
-    if git -C "$wt" rev-parse '@{u}' >/dev/null 2>&1; then
-        local unpushed
-        unpushed=$(git -C "$wt" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
-        if [ "$unpushed" -gt 0 ]; then
-            echo "  [SKIP $unpushed unpushed] $pname $label"
-            return 1
-        fi
     fi
 
     return 0
@@ -638,9 +729,18 @@ for project in "$PROJECT_DIR"/*; do
             root_tag=$(basename "$(dirname "$worktree_root")")/$(basename "$worktree_root")
             label="$root_tag/$wt_name"
 
+            # A dir here that is not a git tree at all is likely the residue
+            # of a lost worktree registration — its files may be the only copy
+            # of someone's work. Report, never delete.
+            if ! git -C "$worktree_dir" rev-parse --git-dir >/dev/null 2>&1; then
+                echo "  [KEEP not a git tree — orphaned files?] $project_name $label"
+                wt_skipped=$((wt_skipped + 1))
+                continue
+            fi
+
             if echo "$wt_name" | grep -qE '^issue-[0-9]+$'; then
                 # Issue worktree: only remove if the corresponding issue is CLOSED,
-                # then run the same safety checks the broader walk uses.
+                # and never with open handles or work that exists nowhere else.
                 issue_num="${wt_name#issue-}"
                 issue_state=$(cd "$project" && gh issue view "$issue_num" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
 
@@ -650,16 +750,14 @@ for project in "$PROJECT_DIR"/*; do
                     continue
                 fi
 
-                # Use `git status --porcelain` so untracked files block removal too;
-                # `git diff` only inspects tracked-file changes.
-                if [ -n "$(cd "$worktree_dir" && git status --porcelain 2>/dev/null)" ]; then
-                    echo "  [SKIP uncommitted] $project_name $label"
+                if has_open_handles "$worktree_dir"; then
+                    echo "  [SKIP open handles] $project_name $label"
                     wt_skipped=$((wt_skipped + 1))
                     continue
                 fi
 
-                if is_in_active_worktree "$worktree_dir"; then
-                    echo "  [SKIP active] $project_name $label"
+                if has_unpushed_work "$worktree_dir"; then
+                    echo "  [KEEP uncommitted/unpushed] $project_name $label"
                     wt_skipped=$((wt_skipped + 1))
                     continue
                 fi
@@ -674,10 +772,24 @@ for project in "$PROJECT_DIR"/*; do
             fi
 
             if [ "$CHECK_MODE" = false ]; then
-                worktree_abs="$(cd "$worktree_dir" && pwd)"
-                (cd "$project" && git worktree remove "$worktree_abs" --force 2>/dev/null) || \
+                worktree_abs="$(cd "$worktree_dir" && pwd -P)"
+                if [ -f "$worktree_dir/.git" ]; then
+                    # Registered worktree: no --force and no rm -rf fallback —
+                    # if git refuses (e.g. files appeared between our checks
+                    # and now), leave it for a future run.
+                    if (cd "$project" && git worktree remove "$worktree_abs" 2>/dev/null); then
+                        echo "    ✓ Removed worktree"
+                    else
+                        echo "    ⚠️  git worktree remove refused — left in place"
+                        wt_skipped=$((wt_skipped + 1))
+                        continue
+                    fi
+                else
+                    # Stray full clone stuffed under the worktree root — it
+                    # passed the WIP checks above, so plain delete is safe.
                     rm -rf "$worktree_dir" 2>/dev/null
-                echo "    ✓ Removed worktree"
+                    echo "    ✓ Removed stray clone"
+                fi
             fi
             wt_cleaned=$((wt_cleaned + 1))
         done
