@@ -4,6 +4,7 @@
 .loom-checkpoint
 .loom-managed
 .no-changes-needed
+.snapshots/
 .loom/.daemon.pid
 .loom/.daemon.log
 .loom/daemon.sock
@@ -47,7 +48,9 @@
 .loom/*.sock
 .loom/*.tmp
 .loom/*.bak
+.loom/.install.lock
 .loom/logs/
+.loom/.resync-in-progress
 # <<< loom-managed <<<
 
 # Repo Skills machine-local install metadata (absolute source path + timestamp)

@@ -95,6 +95,94 @@
 #       escalates to a maximally actionable DIVERGENCE report (exit 1) with the
 #       explicit recovery commands — never an automatic kill/restart.
 #
+# TICK-GRANULARITY DETECTION LATENCY IS AN ACCEPTED TRADEOFF (#5790)
+#   An operator saw `loom-daemon status` itself time out on IPC twice ~20
+#   minutes apart (one successful `status` in between) while this watchdog's
+#   own log read `[OK] daemon healthy` throughout. Two independent, additive
+#   mechanisms explain that without the probe being absent or broken:
+#     1. SUB-TICK WEDGES ARE STRUCTURALLY INVISIBLE. This probe samples ONCE
+#        per StartInterval tick (default LOOM_WATCHDOG_INTERVAL_SECS=300, see
+#        defaults/docs/daemon-reference.md). A wedge that resolves faster than
+#        one tick interval can fall entirely between two samples and never be
+#        observed at all. This is inherent to any periodic sampled probe, not
+#        a bug: closing it completely would require continuous polling or
+#        multiple samples per tick, trading resource cost and forge-issue /
+#        log noise for lower latency — a real design change, deliberately left
+#        as future work rather than folded into this fix.
+#     2. A SUB-THRESHOLD DIVERGENCE USED TO BE MASKED BY THE SAME TICK'S OK
+#        LINE. Before #5790, a tick whose probe DID fire during a wedge and
+#        correctly logged a sub-threshold `[DIVERGENCE] ... consecutive
+#        failure N of <threshold>` line then fell through to section 4 and
+#        unconditionally appended `[OK] daemon healthy ...` right after it —
+#        so an operator or log-scraper reading only the last line, or grepping
+#        for `[OK]`, saw a clean bill of health in the SAME tick a divergence
+#        was already reported. #5790 fixes this specific defect (see
+#        `report_heartbeat_ok()` below): that OK line now folds in the
+#        divergence instead of reading as unambiguously healthy. This was a
+#        pure reporting defect — the exit code (via `exit_ok()`) already
+#        reflected `PROBE_DIVERGED` correctly, so any consumer keyed off exit
+#        code alone (rather than the log text) was never misled by it.
+#   Given (2) is now fixed, ANY wedge that persists through at least one full
+#   tick is reported the very tick it is observed — detection latency for that
+#   class is bounded by ONE tick (≤300s by default), not by
+#   LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD (that threshold only gates the
+#   CONFIRMED/report-vs-recover distinction, never whether a single failure is
+#   reported at all — see "consecutive failure N of threshold" above). Only
+#   (1), sub-tick-duration wedges, remains genuinely undetectable by this
+#   probe's design, and this default cadence — 300s ticks, 3-consecutive
+#   CONFIRMED threshold — is kept as the correct tradeoff: it already reports
+#   every observed divergence immediately (loud, unconditional stderr, logged
+#   regardless of --verbose) while reserving the escalation-worthy CONFIRMED
+#   label and its exit-1-every-tick behavior for a hang proven to be sustained
+#   across debounced samples (#4279's transient-contention rationale, above).
+#   Lowering the default interval would shrink the sub-tick blind spot but
+#   raise per-host probe overhead and false-positive risk fleet-wide for a
+#   marginal gain; that tradeoff is not taken here without fleet data
+#   justifying it.
+#
+# A WINDOWED/RATE FAILURE SIGNAL, ALONGSIDE THE CONSECUTIVE ONE (#5944)
+#   Both mechanisms above — the same-tick fold-in (#5790) and the CONFIRMED
+#   escalation (#4398) — key off `probe_fail_count_*`, a streak that is reset
+#   to ZERO by a single successful round-trip ("ends any prior failure streak
+#   outright", see that function's own comment). That reset is exactly right
+#   for the CONFIRMED-hang decision — a hang that heals on its own should not
+#   count toward the next one — but it leaves a THIRD failure shape
+#   unhandled: a probe that fails, succeeds, fails, succeeds... under host
+#   load, never 3-in-a-row. Every individual failing tick still gets its own
+#   sub-threshold DIVERGENCE line (unchanged, and still correct), but each
+#   intervening SUCCESS resets the streak to zero and reports a bare
+#   `[OK] daemon healthy` for that tick — so hours of intermittent failure
+#   never accumulate into anything an operator or log-scraper skimming the
+#   last line, or grepping for `[OK]`, would notice. Observed live on a host
+#   at load 45-65 across 28 cores: `loom-daemon status` timed out on
+#   essentially every operator invocation for hours while this watchdog's log
+#   read `[OK] daemon healthy` throughout.
+#
+#   The fix is a SECOND, independent tally: a rolling WINDOW of the last
+#   LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS probe outcomes (default 6 — 30
+#   minutes at the default 300s cadence), keyed to the live pid exactly like
+#   the consecutive tally (a relaunched daemon starts a fresh window, same
+#   reasoning as #4398's pid-keyed streak: a fresh process must never inherit
+#   its wedged predecessor's history). Unlike the consecutive tally, a single
+#   SUCCESS does NOT clear this history — only the window sliding an old tick
+#   out of range does. When LOOM_WATCHDOG_IPC_PROBE_WINDOW_FAIL_THRESHOLD
+#   (default 3) or more of the last WINDOW_TICKS ticks failed, even a tick
+#   whose OWN round-trip just succeeded is reported DEGRADED (not a bare OK,
+#   via `report_heartbeat_ok()`'s existing PROBE_DIVERGED fold-in — the same
+#   plumbing #5790 built, reused rather than duplicated) and the tick's exit
+#   code reflects it (non-zero), carrying the host load average at probe time
+#   (`get_load_average()`, #5790) so the report doubles as the load-contention
+#   diagnosis.
+#
+#   Deliberately weaker than a CONFIRMED hang: the windowed signal is
+#   report-only, never escalates to the "IPC UNRESPONSIVE (CONFIRMED)" text,
+#   its exit-1-no-remediation posture, or the #5391 bounded-recovery path —
+#   the daemon DID answer on the ticks in between, which is real evidence
+#   against a genuine wedge (#4279's transient-contention rationale). The
+#   default threshold (3 of the last 6) also will not fire on a single
+#   isolated failure — that already gets its own sub-threshold DIVERGENCE
+#   line via the unchanged #5790 path and is not this mechanism's job.
+#
 # SOCKET-FIRST LIVENESS, PID FILE DEMOTED TO A HINT (#5118)
 #   Until #5118 the OUT-OF-BAND probe above was the ONLY thing that could
 #   establish liveness, and on a host with neither a launchd job nor a
@@ -201,11 +289,21 @@
 #        until either a tick observes a healthy daemon or an operator deletes
 #        the state file. A broken binary therefore gets at most 5 restarts,
 #        never an unbounded loop.
-#     4. NEVER REVIVES A DELIBERATE STOP. An operator-stop exit signature
-#        (launchd `last exit status` 143/130/-15/-2; systemd
-#        ExecMainCode=killed with TERM/INT) is classified as intent and is
-#        NEVER auto-recovered — it is reported, loudly, and left alone. This
-#        preserves the #4232/#4862 narrow gates' own guarantee unchanged.
+#     4. NEVER REVIVES A DELIBERATE STOP — KEYED ON THE MARKER, NOT THE EXIT
+#        CODE (#6388). A scripted stop (loom-daemon-stop.sh) removes the
+#        autonomy-desired marker BEFORE it kills the daemon, so a deliberate
+#        stop never reaches this block at all — the marker-ABSENT branch near
+#        the top of this script is the ONLY place "never revive" fires, and it
+#        fires unconditionally there, before any exit code is ever read. A
+#        signal-shaped exit code recorded HERE (marker confirmed present) —
+#        launchd `last exit status` 143/130/-15/-2; systemd
+#        ExecMainCode=killed with TERM/INT — used to be misread as the SAME
+#        "operator stop" intent and skipped recovery outright; a stray SIGTERM
+#        (e.g. an unrelated test run) then reads exactly like a deliberate
+#        stop and starves autonomy for as long as no human notices (an 11h
+#        outage, #6388). It is now just another kind of death: it gets the
+#        SAME bounded recovery as any other crash, with the signal named in
+#        the report text so an operator can see which rule fired.
 #
 #   WHAT IT RUNS: the sibling ./loom-daemon-start.sh — the exact command this
 #   watchdog has always printed — replaying ONLY the autonomy flags the last
@@ -246,7 +344,9 @@
 #      recovery ran/was deferred/was suppressed and the daemon is still down),
 #      or is running but its
 #      heartbeat is stale (possibly wedged), OR (#4398) it is running with a
-#      fresh heartbeat but its bounded IPC round-trip failed, OR (#4331) a daemon
+#      fresh heartbeat but its bounded IPC round-trip failed, OR (#5944) its
+#      round-trip succeeded THIS tick but failed often enough across the
+#      recent windowed history to report DEGRADED anyway, OR (#4331) a daemon
 #      IS running while the marker is ABSENT (crash protection disarmed — a WARN
 #      state mismatch), OR (#5118) the socket answers while the supervisor says
 #      its job is down (an UNSUPERVISED daemon — serving work, but not crash
@@ -334,6 +434,25 @@
 #                                (default: LOOM_DAEMON_STARTUP_GRACE_SECS, else 90).
 #   LOOM_WATCHDOG_IPC_PROBE_STATE  #4398: path to the consecutive-failure counter
 #                                (default <loom dir>/.watchdog-probe-fail-count).
+#   LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS  #5944: size (in ticks) of the rolling
+#                                window used for the rate-based failure signal,
+#                                alongside (not instead of) the consecutive
+#                                tally above (default 6 — 30 minutes at the
+#                                default 300s cadence).
+#   LOOM_WATCHDOG_IPC_PROBE_WINDOW_FAIL_THRESHOLD  #5944: failures within the
+#                                last WINDOW_TICKS ticks that report a
+#                                DEGRADED verdict even on a tick whose own
+#                                round-trip succeeded (default 3). Report-only,
+#                                distinct from the CONFIRMED-hang escalation:
+#                                never triggers exit-1-no-remediation posture
+#                                changes or #5391 bounded recovery on its own.
+#   LOOM_WATCHDOG_IPC_PROBE_WINDOW_STATE  #5944: path to the rolling-window
+#                                state (default <loom dir>/.watchdog-probe-window).
+#   LOOM_WATCHDOG_LOAD_AVG_PROC_PATH  #5790: test seam for the /proc/loadavg
+#                                source get_load_average() reads on Linux
+#                                (default /proc/loadavg). Not meant for
+#                                production use — point it at an unreadable
+#                                path to exercise the "unavailable" degrade.
 #   LOOM_FORCE_PORTABLE_TIMEOUT    #4398, renamed from the watchdog-local
 #                                LOOM_WATCHDOG_FORCE_PORTABLE_TIMEOUT by #4832
 #                                when bounded_run() moved to the shared
@@ -342,6 +461,35 @@
 #                                seam for the default macOS no-`timeout` shape).
 #   LOOM_DAEMON_BIN               Explicit loom-daemon binary for the IPC probe
 #                                (same resolution order as loom-daemon-start.sh).
+#   LOOM_WATCHDOG_PEER_COORD_CHECK  #6222 (Layer 3 of #6157): 0/false/no disables
+#                                the peer-coordination alert entirely (default: on).
+#                                Only ever attempted on a tick whose own IPC
+#                                round-trip already succeeded (`probe_verdict ==
+#                                healthy`) — never adds a new hang surface.
+#   LOOM_WATCHDOG_PEER_COORD_TIMEOUT_SECS  #6222: hard external budget for the
+#                                `loom-daemon peer-claims --json` query (default:
+#                                same as LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS).
+#   LOOM_WATCHDOG_PEER_COORD_SENTINEL  #6222: dedupe sentinel for the peer-
+#                                coordination escalation (default <loom dir>
+#                                /.watchdog-peer-coordination-escalated). Stores
+#                                `<timestamp> <issue-url>` so recovery can
+#                                comment on and close the exact filed issue.
+#   LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR  #6272: test seam ONLY — overrides
+#                                the third (production-intent) branch of the
+#                                create-issue.sh resolution shared by
+#                                escalate_daemon_outage() and
+#                                escalate_peer_coordination_degraded(), which
+#                                otherwise resolves relative to wherever THIS
+#                                SCRIPT lives on disk (default
+#                                $_LOOM_WATCHDOG_CLI_DIR/..), not relative to
+#                                the sandboxable $repo_root the first two
+#                                branches use. Not meant for production use —
+#                                point it at an empty sandbox dir in tests that
+#                                need "no create-issue.sh reachable anywhere"
+#                                to be genuinely unreachable (#6271: an earlier
+#                                test without this seam fell through to this
+#                                repo's own real create-issue.sh and filed a
+#                                spurious live issue).
 
 set -uo pipefail
 
@@ -412,6 +560,12 @@ WATCHDOG_LOG="${LOOM_WATCHDOG_LOG:-$LOOM_DIR/logs/daemon-watchdog.log}"
 PROBE_TIMEOUT_SECS="${LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS:-15}"
 [[ "$PROBE_TIMEOUT_SECS" =~ ^[0-9]+$ ]] || PROBE_TIMEOUT_SECS=15
 PROBE_ARGS="${LOOM_WATCHDOG_IPC_PROBE_ARGS:-quarantine list}"
+# #6222 (Layer 3 of #6157): the peer-coordination alert's own external budget.
+# Defaults to the same value as the general IPC probe's — it is the identical
+# shape of call (a bounded round-trip through the installed CLI) — but stays
+# independently overridable for tests and tuning.
+PEER_COORD_TIMEOUT_SECS="${LOOM_WATCHDOG_PEER_COORD_TIMEOUT_SECS:-$PROBE_TIMEOUT_SECS}"
+[[ "$PEER_COORD_TIMEOUT_SECS" =~ ^[0-9]+$ ]] || PEER_COORD_TIMEOUT_SECS="$PROBE_TIMEOUT_SECS"
 PROBE_FAIL_THRESHOLD="${LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD:-3}"
 [[ "$PROBE_FAIL_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || PROBE_FAIL_THRESHOLD=3
 # Mirrors daemon_install_state::DEFAULT_STARTUP_GRACE_SECS (90) and honors the
@@ -420,9 +574,64 @@ PROBE_FAIL_THRESHOLD="${LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD:-3}"
 PROBE_GRACE_SECS="${LOOM_WATCHDOG_IPC_PROBE_GRACE_SECS:-${LOOM_DAEMON_STARTUP_GRACE_SECS:-90}}"
 [[ "$PROBE_GRACE_SECS" =~ ^[0-9]+$ ]] || PROBE_GRACE_SECS=90
 PROBE_STATE_FILE="${LOOM_WATCHDOG_IPC_PROBE_STATE:-$LOOM_DIR/.watchdog-probe-fail-count}"
+# #5944: the WINDOWED/rate signal, alongside (never instead of) the
+# consecutive tally above — see "A WINDOWED/RATE FAILURE SIGNAL" in the header
+# for the full rationale.
+PROBE_WINDOW_TICKS="${LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS:-6}"
+[[ "$PROBE_WINDOW_TICKS" =~ ^[1-9][0-9]*$ ]] || PROBE_WINDOW_TICKS=6
+PROBE_WINDOW_FAIL_THRESHOLD="${LOOM_WATCHDOG_IPC_PROBE_WINDOW_FAIL_THRESHOLD:-3}"
+[[ "$PROBE_WINDOW_FAIL_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || PROBE_WINDOW_FAIL_THRESHOLD=3
+PROBE_WINDOW_STATE_FILE="${LOOM_WATCHDOG_IPC_PROBE_WINDOW_STATE:-$LOOM_DIR/.watchdog-probe-window}"
 # Set true once a probe divergence has been REPORTED on this tick, so the
 # heartbeat section's otherwise-healthy exits still surface a non-zero code.
 PROBE_DIVERGED=false
+# #5944: overrides the default report_heartbeat_ok() fold-in note (see that
+# function) when PROBE_DIVERGED was set for a reason OTHER than "this same
+# tick's own probe failed" — currently only the windowed/rate signal, which
+# can fire on a tick whose own round-trip succeeded.
+PROBE_DIVERGED_NOTE=""
+# #5790: test seam only (see the env-var doc block above) — production hosts
+# should never set this.
+LOAD_AVG_PROC_PATH="${LOOM_WATCHDOG_LOAD_AVG_PROC_PATH:-/proc/loadavg}"
+
+# ---------- host load-average capture (#5790) ----------
+# A DIVERGENCE report says "the IPC round-trip failed" but not WHY — attaching
+# the host's load average lets an operator see at a glance whether the tick
+# correlates with heavy contention (consistent with #4279's transient-failure
+# rationale) or occurred on an otherwise-idle host (pointing at the daemon
+# itself). Best-effort ONLY: never allowed to fail or slow down a tick, and
+# degrades to the literal string "unavailable" if no source can be read on
+# this platform, rather than aborting or inventing a number.
+#
+# Tried in this order:
+#   1. `uptime` — the most portable source, present on both Linux and macOS/BSD
+#      (with slightly different wording: "load average:" vs "load averages:";
+#      the sed pattern below matches either).
+#   2. `sysctl -n vm.loadavg` — the macOS-native fallback for a host whose
+#      `uptime` output cannot be parsed (or whose text format changes).
+#   3. /proc/loadavg — the Linux-native fallback, notably still present in
+#      minimal containers that ship no `uptime` binary at all.
+get_load_average() {
+    local out=""
+    if command -v uptime >/dev/null 2>&1; then
+        out="$(uptime 2>/dev/null | sed -n 's/.*load average[s]*: *//p')"
+    fi
+    if [[ -z "$out" ]] && command -v sysctl >/dev/null 2>&1; then
+        out="$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}')"
+    fi
+    if [[ -z "$out" ]] && [[ -r "$LOAD_AVG_PROC_PATH" ]]; then
+        out="$(cut -d' ' -f1-3 "$LOAD_AVG_PROC_PATH" 2>/dev/null)"
+    fi
+    # Trim leading/trailing whitespace picked up from `uptime`/`sysctl` output.
+    # xargs is a portable no-dependency trim; read -r would also work but this
+    # matches the trim idiom already used elsewhere in this script.
+    out="$(printf '%s' "$out" | xargs 2>/dev/null || true)"
+    if [[ -n "$out" ]]; then
+        printf '%s' "$out"
+    else
+        printf 'unavailable'
+    fi
+}
 
 # ---------- general-case bounded-recovery knobs (#5391) ----------
 # See "GENERAL-CASE BOUNDED RECOVERY + CIRCUIT BREAKER (#5391)" in the header for
@@ -441,6 +650,13 @@ RECOVER_TIMEOUT_SECS="${LOOM_WATCHDOG_RECOVER_TIMEOUT_SECS:-120}"
 [[ "$RECOVER_TIMEOUT_SECS" =~ ^[0-9]+$ ]] || RECOVER_TIMEOUT_SECS=120
 RECOVERY_STATE_FILE="${LOOM_WATCHDOG_RECOVERY_STATE:-$LOOM_DIR/.watchdog-recovery-state}"
 ESCALATION_SENTINEL="${LOOM_WATCHDOG_ESCALATION_SENTINEL:-$LOOM_DIR/.watchdog-outage-escalated}"
+# #6222 (Layer 3 of #6157): dedupe sentinel for the peer-coordination alert,
+# separate from the daemon-outage sentinel above — the two escalations are
+# independent episodes (a daemon can be fully alive and answering while its
+# peer-claim receive path is degraded). Stores "<timestamp> <issue-url>" (not
+# just a timestamp, unlike ESCALATION_SENTINEL) so the recovery path below can
+# comment on and close the EXACT issue this episode filed.
+PEER_COORD_SENTINEL="${LOOM_WATCHDOG_PEER_COORD_SENTINEL:-$LOOM_DIR/.watchdog-peer-coordination-escalated}"
 
 # Append a timestamped line to the watchdog log (best-effort) and echo to
 # stderr, which launchd captures to the job's StandardErrorPath. This IS the
@@ -457,6 +673,35 @@ report() {
         OK)         [[ "$VERBOSE" == "true" ]] && echo -e "${GREEN}$ts [$level] $msg${NC}" >&2 ;;
         *)          echo -e "${YELLOW}$ts [$level] $msg${NC}" >&2 ;;
     esac
+}
+
+# Section 4 (the heartbeat-derived reality check) has several exit paths that
+# each end in a plain `report OK "daemon healthy/alive ..."` line. Before
+# #5790, that call happened UNCONDITIONALLY — even on a tick where the #4398
+# IPC probe above already logged a sub-threshold DIVERGENCE
+# (PROBE_DIVERGED=true, loom-daemon-watchdog.sh's probe-verdict case
+# statement). An operator or log-scraper reading only the log's last line, or
+# grepping for `[OK]`, would see a clean bill of health in the SAME tick a
+# divergence was reported moments earlier — exactly the "[OK] daemon healthy"
+# blind spot #5790 reports. exit_ok() already made the EXIT CODE correct
+# (non-zero when PROBE_DIVERGED); this closes the matching gap in the LOG
+# TEXT: every section-4 OK-shaped call must route through here instead of
+# calling `report OK` directly, so a diverged tick is never described as
+# unambiguously healthy in its own log line.
+report_heartbeat_ok() { # <message, matches the historical "report OK" text>
+    local msg="$*"
+    if [[ "$PROBE_DIVERGED" == "true" ]]; then
+        # #5944: PROBE_DIVERGED_NOTE lets a diverging path OTHER than "this
+        # same tick's own probe failed" (currently only the windowed/rate
+        # signal, which can fire on a tick whose round-trip just succeeded)
+        # override the historical note text below with one that describes
+        # itself accurately instead of pointing at a DIVERGENCE line that, on
+        # that path, was never printed this tick.
+        local note="${PROBE_DIVERGED_NOTE:-the IPC probe diverged earlier this tick (see the DIVERGENCE line above) — dispatch may be degraded despite a fresh/liveness-only-OK heartbeat signal; the exit code for this tick reflects the divergence, not this line.}"
+        report DEGRADED "${msg} NOTE: ${note}"
+    else
+        report OK "$msg"
+    fi
 }
 
 # ---------- marker reader ----------
@@ -690,6 +935,57 @@ probe_fail_count_write() { # <pid> <count>
 
 probe_fail_count_clear() {
     rm -f "$PROBE_STATE_FILE" 2>/dev/null || true
+}
+
+# ---------- windowed/rate failure tally (#5944) ----------
+# A SECOND, INDEPENDENT tally alongside probe_fail_count_* above. That one is
+# reset to zero by a single success (by design, for the CONFIRMED-hang
+# decision); this one is not — see "A WINDOWED/RATE FAILURE SIGNAL" in the
+# header for the full rationale. Format mirrors PROBE_STATE_FILE (`<pid>
+# <payload>`) but the payload is a fixed-width HISTORY STRING instead of a
+# count: one character per tick, oldest first, '0' for a healthy round-trip
+# and '1' for unresponsive, capped at PROBE_WINDOW_TICKS characters. Keyed to
+# the live pid exactly like the consecutive tally, for the identical reason
+# (#4398: a relaunched daemon is a different process and must never inherit
+# its wedged predecessor's history).
+
+# Echoes the pid-keyed history string for <pid>, or "" (never an error) for a
+# missing, malformed, or pid-mismatched state file — a fresh/relaunched pid
+# therefore always starts with an empty window, exactly like
+# probe_fail_count_for_pid.
+probe_window_read() { # <pid>
+    local pid="$1" saved_pid saved_hist
+    [[ -r "$PROBE_WINDOW_STATE_FILE" ]] || { echo ""; return 0; }
+    read -r saved_pid saved_hist < "$PROBE_WINDOW_STATE_FILE" 2>/dev/null || { echo ""; return 0; }
+    [[ "$saved_pid" == "$pid" ]] || { echo ""; return 0; }
+    echo "$saved_hist"
+}
+
+probe_window_write() { # <pid> <history>
+    mkdir -p "$(dirname "$PROBE_WINDOW_STATE_FILE")" 2>/dev/null
+    printf '%s %s\n' "$1" "$2" > "$PROBE_WINDOW_STATE_FILE" 2>/dev/null || true
+}
+
+# Append this tick's outcome to <pid>'s window, slide it to at most
+# PROBE_WINDOW_TICKS characters (dropping the OLDEST entry, not the newest),
+# persist it, and set two globals the caller reads immediately afterward:
+#   PROBE_WINDOW_LEN         entries currently in the window (<= PROBE_WINDOW_TICKS;
+#                             only fewer while the window has not filled yet)
+#   PROBE_WINDOW_FAIL_COUNT  how many of those entries are failures ('1')
+# Deliberately called for `healthy` and `unresponsive` verdicts only — a
+# `skipped` verdict (startup grace, no resolvable binary, probe disabled, a
+# daemon-side application error that PROVES IPC works, ...) is not evidence
+# either way and must never be recorded into the window, mirroring the
+# consecutive tally's own "none of these may increment the tally" contract.
+probe_window_record() { # <pid> <outcome: 0=healthy 1=unresponsive>
+    local pid="$1" outcome="$2" hist
+    hist="$(probe_window_read "$pid")${outcome}"
+    if (( ${#hist} > PROBE_WINDOW_TICKS )); then
+        hist="${hist: -${PROBE_WINDOW_TICKS}}"
+    fi
+    probe_window_write "$pid" "$hist"
+    PROBE_WINDOW_LEN=${#hist}
+    PROBE_WINDOW_FAIL_COUNT="$(printf '%s' "$hist" | tr -dc '1' | wc -c | tr -d '[:space:]')"
 }
 
 # Run the bounded probe command ONCE. Extracted from run_ipc_probe() by #5118 so
@@ -935,19 +1231,31 @@ recovery_backoff_for() { # <attempt-number, 1-based>
     echo "$backoff"
 }
 
-# Classify the supervisor's recorded last-exit as an OPERATOR STOP (SIGTERM /
-# SIGINT) rather than a fault. Sets `operator_stop_detail` non-empty when it is.
-#
-# This is the #5391 recovery's hard "never revive a deliberate stop" guard, and
-# it is deliberately the SAME evidence the #4232/#4862 narrow gates read (the
-# supervisor's own record), just interpreted for the opposite decision: those
-# gates fire ONLY on exit 0, this one refuses to fire on a termination signal.
-# loom-daemon-stop.sh also removes the autonomy-desired marker (so a scripted
-# stop never reaches this code at all — the marker-absent path handles it), but a
-# hand-`kill`ed daemon leaves the marker behind, and reviving THAT would be
-# exactly the "watchdog fought the operator" failure mode.
-detect_operator_stop_signature() {
-    operator_stop_detail=""
+# Classify the supervisor's recorded last-exit as a TERMINATION SIGNAL
+# (SIGTERM/SIGINT) rather than a plain nonzero-exit fault. Sets
+# `supervisor_exit_signal_detail` non-empty when it is — PURELY INFORMATIONAL
+# (#6388). This USED TO be the #5391 recovery's hard "never revive a
+# deliberate stop" guard (forcing `recover_possible=false` whenever it fired,
+# under the name `detect_operator_stop_signature`), on the theory that
+# SIGTERM/SIGINT is "the signature of an operator-initiated stop, not a
+# fault". That conflated two different facts: "the process received a
+# termination signal" and "the operator wants autonomy off". Only the
+# autonomy-desired marker (`$MARKER`) records the second one — its own
+# contract is "removed ONLY by an operator-initiated loom-daemon-stop.sh" —
+# and this function is called ONLY from the general bounded-recovery block
+# below, which is reached ONLY once the top-of-script intent gate
+# (`[[ ! -f "$MARKER" ]]`) has already confirmed the marker IS present. A
+# scripted stop removes the marker before it kills the daemon, so a genuine
+# deliberate stop never reaches this function at all — the marker-ABSENT
+# branch is what "never revive a deliberate stop" actually rests on. So a
+# signal-shaped exit code recorded HERE (a hand-`kill`, or a stray SIGTERM
+# from a wholly unrelated process — a test suite, in the 11h outage #6388
+# reports) is evidence the process died, not evidence the operator wants it
+# to stay down. It now flows into the SAME bounded-recovery path as any other
+# crash; the caller uses this detail only to name the rule in its own report
+# text (`report DIVERGENCE`), never to skip recovery.
+detect_supervisor_exit_signal() {
+    supervisor_exit_signal_detail=""
     if [[ -n "$launchd_service" ]] && command -v launchctl >/dev/null 2>&1; then
         local last_status
         last_status="$(launchctl print "$launchd_service" 2>/dev/null \
@@ -955,7 +1263,7 @@ detect_operator_stop_signature() {
             | head -n1 | grep -oE '[-0-9]+$')"
         case "$last_status" in
             143|130|-15|-2)
-                operator_stop_detail="launchd records the job's last exit status as ${last_status} (SIGTERM/SIGINT — the signature of an operator-initiated stop, not a fault)"
+                supervisor_exit_signal_detail="launchd records the job's last exit status as ${last_status} (SIGTERM/SIGINT)"
                 ;;
         esac
     elif [[ -n "$systemd_service" ]] && command -v systemctl >/dev/null 2>&1; then
@@ -965,13 +1273,13 @@ detect_operator_stop_signature() {
         if [[ "$exec_code" == "killed" ]]; then
             case "$exec_status" in
                 TERM|INT|15|2)
-                    operator_stop_detail="systemd records the unit's main process as killed by SIG${exec_status} (the signature of an operator-initiated stop, not a fault)"
+                    supervisor_exit_signal_detail="systemd records the unit's main process as killed by SIG${exec_status}"
                     ;;
             esac
         elif [[ "$exec_code" == "exited" ]]; then
             case "$exec_status" in
                 143|130)
-                    operator_stop_detail="systemd records the unit's main process as exiting ${exec_status} (SIGTERM/SIGINT — the signature of an operator-initiated stop, not a fault)"
+                    supervisor_exit_signal_detail="systemd records the unit's main process as exiting ${exec_status} (SIGTERM/SIGINT)"
                     ;;
             esac
         fi
@@ -1069,15 +1377,28 @@ escalate_daemon_outage() { # <reason-summary>
     [[ "${LOOM_WATCHDOG_ESCALATE:-}" =~ ^(0|false|no)$ ]] && return 1
     [[ -f "$ESCALATION_SENTINEL" ]] && return 1
 
-    local repo_root issue_script
+    local repo_root issue_script fallback_dir
     repo_root="$(marker_get repo_root)"
     issue_script=""
     if [[ -n "$repo_root" && -x "$repo_root/.loom/scripts/create-issue.sh" ]]; then
         issue_script="$repo_root/.loom/scripts/create-issue.sh"
     elif [[ -n "$repo_root" && -x "$repo_root/defaults/scripts/create-issue.sh" ]]; then
         issue_script="$repo_root/defaults/scripts/create-issue.sh"
-    elif [[ -x "$_LOOM_WATCHDOG_CLI_DIR/../create-issue.sh" ]]; then
-        issue_script="$_LOOM_WATCHDOG_CLI_DIR/../create-issue.sh"
+    else
+        # Branch 3 (production intent): find the sibling create-issue.sh next
+        # to an INSTALLED watchdog, when neither of the $repo_root-relative
+        # branches above found one. NOT sandboxable via $repo_root — by
+        # default this resolves relative to wherever this script itself lives
+        # on disk (#6272). A test that invokes this file from its real
+        # in-repo path will silently fall through to THIS repo's own real,
+        # gh-authenticated defaults/scripts/create-issue.sh here whenever
+        # $repo_root has no copy of its own — already filed one spurious live
+        # issue (#6271). Tests exercising "no create-issue.sh reachable
+        # anywhere" MUST set LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR to an
+        # empty sandbox dir first (see test-loom-daemon-watchdog.sh's #6272
+        # regression tests).
+        fallback_dir="${LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR:-$_LOOM_WATCHDOG_CLI_DIR/..}"
+        [[ -x "$fallback_dir/create-issue.sh" ]] && issue_script="$fallback_dir/create-issue.sh"
     fi
     [[ -n "$issue_script" ]] || return 1
 
@@ -1114,6 +1435,184 @@ EOF
         --label "loom:triage" >/dev/null 2>&1; then
         mkdir -p "$(dirname "$ESCALATION_SENTINEL")" 2>/dev/null || true
         date -u '+%Y-%m-%dT%H:%M:%SZ' > "$ESCALATION_SENTINEL" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+# ---------- peer-coordination out-of-band alert (#6222, Layer 3 of #6157) ----------
+# #6157/#6220 (Layers 1-2) made a degraded `peer_coordination` health section
+# fail-visible to anything that already runs `loom-daemon health` by hand, and
+# froze stale-claim reclamation while it holds. This is the deferred Layer 3:
+# complain PROACTIVELY, the same way #5391's outage escalation above does —
+# modeled on it directly, right down to the dedupe-sentinel shape — instead of
+# waiting for an operator to think to check.
+#
+# Deliberately queries the THIN `loom-daemon peer-claims --json` wrapper, never
+# `loom-daemon health --json`: the latter fans out a `gh` call PER MANAGED REPO
+# for its `queues`/`throughput` sections (see the "LIGHTWEIGHT SUBCOMMAND, NOT
+# `status`" note in this file's header — the same 15s-against-a-healthy-daemon
+# trap that made `quarantine list` the IPC probe's own choice, not `status`).
+# `peer-claims` is a single IPC round-trip with no such fan-out, carrying the
+# exact `PeerCoordinationHealth` fields (`degraded`, `degraded_for_secs`,
+# `consecutive_receives_toward_recovery`, `recovery_threshold`) this alert
+# needs to be self-describing.
+#
+# Sets PEER_COORD_VERDICT to "Degraded" / "Green", plus PEER_COORD_SUMMARY and
+# the individual fields below, on success; returns 1 with every field cleared
+# when the state could not be determined this tick (disabled, no jq, no
+# bounded_run, no resolvable binary, the query failed/timed out, or the JSON
+# did not have the expected shape) — "could not tell" is never treated as
+# evidence either way, mirroring every other best-effort probe in this file.
+check_peer_coordination_health() {
+    PEER_COORD_VERDICT=""
+    PEER_COORD_SUMMARY=""
+    PEER_COORD_DEGRADED_FOR=""
+    PEER_COORD_CONSECUTIVE=""
+    PEER_COORD_RECOVERY_THRESHOLD=""
+    PEER_COORD_ADVERTISED=""
+    PEER_COORD_RECEIVED=""
+
+    [[ "${LOOM_WATCHDOG_PEER_COORD_CHECK:-}" =~ ^(0|false|no)$ ]] && return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    command -v bounded_run >/dev/null 2>&1 || return 1
+
+    local bin
+    bin="$(locate_daemon_bin)" || return 1
+    [[ -n "$bin" ]] || return 1
+
+    local out rc json
+    out="$(mktemp "${TMPDIR:-/tmp}/loom-watchdog-peercoord.XXXXXX" 2>/dev/null)" || return 1
+    LOOM_SOCKET_PATH="$SOCKET_PATH" bounded_run "$PEER_COORD_TIMEOUT_SECS" \
+        "$bin" peer-claims --json > "$out" 2>/dev/null
+    rc=$?
+    json="$(cat "$out" 2>/dev/null)"
+    rm -f "$out" 2>/dev/null
+    [[ "$rc" -eq 0 && -n "$json" ]] || return 1
+
+    # NOTE: deliberately `| tostring`, never `.coordination.degraded // empty`.
+    # jq's `//` treats `false` — not just `null`/missing — as falsy, so a
+    # genuinely healthy `{"degraded": false, ...}` would silently collapse to
+    # empty and be indistinguishable from "the field is absent" (an older
+    # binary / malformed reply), permanently misreading every recovery as
+    # "could not determine". `tostring` keeps `true`/`false` distinguishable
+    # from the `null` a missing/absent field actually produces.
+    local degraded
+    degraded="$(printf '%s' "$json" | jq -r '.coordination.degraded | tostring' 2>/dev/null)"
+    case "$degraded" in
+        true) PEER_COORD_VERDICT="Degraded" ;;
+        false) PEER_COORD_VERDICT="Green" ;;
+        *) return 1 ;; # null / absent / not the expected shape — unknown
+    esac
+
+    PEER_COORD_DEGRADED_FOR="$(printf '%s' "$json" | jq -r '.coordination.degraded_for_secs // empty' 2>/dev/null)"
+    PEER_COORD_CONSECUTIVE="$(printf '%s' "$json" | jq -r '.coordination.consecutive_receives_toward_recovery // empty' 2>/dev/null)"
+    PEER_COORD_RECOVERY_THRESHOLD="$(printf '%s' "$json" | jq -r '.coordination.recovery_threshold // empty' 2>/dev/null)"
+    PEER_COORD_ADVERTISED="$(printf '%s' "$json" | jq -r '.advertised // empty' 2>/dev/null)"
+    PEER_COORD_RECEIVED="$(printf '%s' "$json" | jq -r '.received // empty' 2>/dev/null)"
+    if [[ "$PEER_COORD_VERDICT" == "Degraded" ]]; then
+        PEER_COORD_SUMMARY="peer-claim receive path DEGRADED (${PEER_COORD_RECEIVED:-0} received / ${PEER_COORD_ADVERTISED:-0} advertised), degraded for ${PEER_COORD_DEGRADED_FOR:-?}s — ${PEER_COORD_CONSECUTIVE:-0}/${PEER_COORD_RECOVERY_THRESHOLD:-?} sustained receive(s) toward recovery"
+    else
+        PEER_COORD_SUMMARY="peer-claim receive path healthy (${PEER_COORD_RECEIVED:-0} received / ${PEER_COORD_ADVERTISED:-0} advertised)"
+    fi
+    return 0
+}
+
+# File ONE tracking issue for a peer-coordination degradation episode, deduped
+# by PEER_COORD_SENTINEL exactly like escalate_daemon_outage() dedupes on
+# ESCALATION_SENTINEL — a multi-hour degradation must file exactly once, not
+# once per tick. Unlike that sentinel (a bare timestamp), this one also stores
+# the filed issue's URL so the recovery path can comment on and close the
+# EXACT issue this episode filed, never a bare "clear and forget". Best-effort
+# and NON-FATAL throughout: no create-issue.sh, no forge auth, or an offline
+# host all degrade to the DIVERGENCE log line the caller already prints.
+escalate_peer_coordination_degraded() {
+    [[ "${LOOM_WATCHDOG_ESCALATE:-}" =~ ^(0|false|no)$ ]] && return 1
+    [[ -f "$PEER_COORD_SENTINEL" ]] && return 1
+
+    local repo_root issue_script fallback_dir
+    repo_root="$(marker_get repo_root)"
+    issue_script=""
+    if [[ -n "$repo_root" && -x "$repo_root/.loom/scripts/create-issue.sh" ]]; then
+        issue_script="$repo_root/.loom/scripts/create-issue.sh"
+    elif [[ -n "$repo_root" && -x "$repo_root/defaults/scripts/create-issue.sh" ]]; then
+        issue_script="$repo_root/defaults/scripts/create-issue.sh"
+    else
+        # Branch 3 (production intent): find the sibling create-issue.sh next
+        # to an INSTALLED watchdog, when neither of the $repo_root-relative
+        # branches above found one. NOT sandboxable via $repo_root — see the
+        # identical comment in escalate_daemon_outage() above, and #6272 (the
+        # same landmine, shared by both functions).
+        fallback_dir="${LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR:-$_LOOM_WATCHDOG_CLI_DIR/..}"
+        [[ -x "$fallback_dir/create-issue.sh" ]] && issue_script="$fallback_dir/create-issue.sh"
+    fi
+    [[ -n "$issue_script" ]] || return 1
+
+    local hostname_str body
+    hostname_str="$(hostname 2>/dev/null || echo unknown-host)"
+    body="$(cat <<EOF
+\`loom-daemon health\`'s \`peer_coordination\` section has gone DEGRADED on host
+\`$hostname_str\`. This host's one-way peer-claim RECEIVE path (Safehouse, #6157)
+can no longer be trusted to prove another host has already claimed an issue —
+while this holds, stale-claim reclamation is FROZEN rather than risking a
+duplicate build (see \`.loom/docs/safehouse.md\` -> "Degraded-coordination
+freeze, not host partitioning").
+
+- **Host**: \`$hostname_str\`
+- **Verdict**: $PEER_COORD_SUMMARY
+- **Degraded for**: ${PEER_COORD_DEGRADED_FOR:-unknown}s
+- **Recovery progress**: ${PEER_COORD_CONSECUTIVE:-0}/${PEER_COORD_RECOVERY_THRESHOLD:-?} consecutive sustained receive(s) toward recovery
+- **Watchdog log**: \`$WATCHDOG_LOG\`
+
+**To recover by hand**: run \`loom-daemon peer-claims\` (or \`loom-daemon health\`)
+on \`$hostname_str\` to confirm the live \`peer_coordination\` state, and check
+Safehouse connectivity to peer hosts (\`.loom/docs/safehouse.md\`).
+
+**This alert clears itself** — no manual close needed. Filed automatically by
+the loom-daemon-watchdog.sh peer-coordination escalation (#6222, Layer 3 of
+#6157). Deduped by a sentinel at \`$PEER_COORD_SENTINEL\`, which is cleared
+automatically (and this issue commented on + closed) once a later watchdog
+tick observes \`peer_coordination\` back to healthy.
+EOF
+)"
+    local issue_url create_rc
+    issue_url="$("$issue_script" \
+        --title "peer-claim coordination is DEGRADED on $hostname_str (#6157 Layer 3)" \
+        --body "$body" \
+        --label "loom:triage" 2>/dev/null)"
+    create_rc=$?
+    [[ "$create_rc" -eq 0 && -n "$issue_url" ]] || return 1
+
+    mkdir -p "$(dirname "$PEER_COORD_SENTINEL")" 2>/dev/null || true
+    printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$issue_url" > "$PEER_COORD_SENTINEL" 2>/dev/null || true
+    return 0
+}
+
+# Recovery counterpart: comment on and close the EXACT issue
+# escalate_peer_coordination_degraded() filed, then clear the sentinel — the
+# behavior #5391's own outage escalation never needed (that episode still
+# requires operator action to actually fix; this one self-heals). Best-effort:
+# a missing `gh`, no forge auth, or a failed close leaves the sentinel in place
+# so a LATER healthy tick simply retries rather than silently losing track of
+# an open tracking issue.
+clear_peer_coordination_escalation() {
+    [[ -f "$PEER_COORD_SENTINEL" ]] || return 1
+    local ts issue_ref
+    read -r ts issue_ref < "$PEER_COORD_SENTINEL" 2>/dev/null || true
+    if [[ -z "$issue_ref" ]]; then
+        # Malformed/legacy sentinel with no recorded issue reference — nothing
+        # to close, so just clear it rather than retrying forever.
+        rm -f "$PEER_COORD_SENTINEL" 2>/dev/null || true
+        return 0
+    fi
+    command -v gh >/dev/null 2>&1 || return 1
+
+    local hostname_str
+    hostname_str="$(hostname 2>/dev/null || echo unknown-host)"
+    gh issue comment "$issue_ref" --body "peer-claim coordination has RECOVERED on \`$hostname_str\` (${PEER_COORD_SUMMARY:-see 'loom-daemon peer-claims'}). Closing automatically — filed by the loom-daemon-watchdog.sh peer-coordination escalation (#6222)." >/dev/null 2>&1 || true
+
+    if gh issue close "$issue_ref" --reason completed >/dev/null 2>&1; then
+        rm -f "$PEER_COORD_SENTINEL" 2>/dev/null || true
         return 0
     fi
     return 1
@@ -1179,7 +1678,7 @@ if [[ ! -f "$MARKER" ]]; then
     # start→crash gets a full attempt budget rather than inheriting a tripped
     # breaker from before the operator's deliberate stop.
     recovery_state_clear
-    report OK "no autonomy-desired marker at $MARKER — no daemon expected; nothing to check."
+    report OK "RULE: marker absent -> deliberate stop, not reviving (#6388): no autonomy-desired marker at $MARKER — no daemon expected; nothing to check."
     exit 0
 fi
 
@@ -1429,14 +1928,18 @@ if [[ "$daemon_alive" != "true" ]]; then
     #                               the outage escalates on tick count alone
     #                               rather than waiting for a budget that will
     #                               never be spent.
+    # #6388: reaching this block already means the marker IS present (the
+    # marker-ABSENT branch near the top of this script exits long before here)
+    # — so the ONLY rule that can ever make "never revive a deliberate stop"
+    # apply is marker ABSENCE, which by construction cannot be true at this
+    # point. detect_supervisor_exit_signal() below is therefore purely
+    # informational: a signal-shaped last-exit code is named in the report
+    # text (the "stray signal, recovering" rule) but never blocks recovery.
     recover_skip_reason=""
     recover_possible=true
     RECOVER_ARGV_DETAIL=""
-    detect_operator_stop_signature
-    if [[ -n "$operator_stop_detail" ]]; then
-        recover_possible=false
-        recover_skip_reason="NO auto-recovery was attempted: ${operator_stop_detail}. Reviving a deliberate stop is the one action this watchdog must never take (#4232/#4862/#5391). Restart it explicitly with ./.loom/scripts/cli/loom-daemon-start.sh, or clear the intent with ./.loom/scripts/cli/loom-daemon-stop.sh so this stops reporting."
-    elif [[ "$RECOVER_ENABLED" != "true" ]]; then
+    detect_supervisor_exit_signal
+    if [[ "$RECOVER_ENABLED" != "true" ]]; then
         recover_possible=false
         recover_skip_reason="NO auto-recovery was attempted: it is DISABLED on this host (LOOM_WATCHDOG_AUTO_RECOVER=0). This watchdog is REPORT-ONLY for this outage — an installed watchdog job here means DETECTION, not self-healing, and nothing will bring the daemon back but you."
     elif ! resolve_recovery_argv; then
@@ -1462,8 +1965,16 @@ if [[ "$daemon_alive" != "true" ]]; then
         # short StartInterval) must see the spent attempt and the started
         # backoff clock rather than firing a second concurrent start.
         recovery_state_write "$ep_down_since" "$ep_ticks" "$ep_attempts" "$ep_last_attempt"
+        signal_rule_note=""
+        if [[ -n "$supervisor_exit_signal_detail" ]]; then
+            # RULE: marker present + signal-shaped exit -> stray signal,
+            # recovering (#6388) — named explicitly so the report never again
+            # reads like the contradictory pre-#6388 line (marker present,
+            # yet refusing to recover "because" the exit code).
+            signal_rule_note=" RULE: marker present, ${supervisor_exit_signal_detail} -> stray signal, recovering (NOT a deliberate operator stop — only marker ABSENCE means that, #6388)."
+        fi
         report DIVERGENCE \
-            "A daemon is EXPECTED (autonomy-desired marker present, started $(marker_get started_at)) but is NOT running: ${liveness_detail}. Autonomous dispatch has stopped (down ${outage_secs}s across ${ep_ticks} consecutive watchdog ticks). AUTO-RECOVERING now — bounded attempt ${ep_attempts} of ${RECOVER_MAX_ATTEMPTS} (#5391), running: ${RECOVER_ARGV_DETAIL}"
+            "A daemon is EXPECTED (autonomy-desired marker present, started $(marker_get started_at)) but is NOT running: ${liveness_detail}. Autonomous dispatch has stopped (down ${outage_secs}s across ${ep_ticks} consecutive watchdog ticks).${signal_rule_note} AUTO-RECOVERING now — bounded attempt ${ep_attempts} of ${RECOVER_MAX_ATTEMPTS} (#5391), running: ${RECOVER_ARGV_DETAIL}"
         recover_saved_liveness_detail="$liveness_detail"
         if command -v bounded_run >/dev/null 2>&1; then
             bounded_run "$RECOVER_TIMEOUT_SECS" "${RECOVER_ARGV[@]}" >/dev/null 2>&1
@@ -1552,11 +2063,37 @@ case "$probe_verdict" in
         # A successful round-trip ends any prior failure streak outright: the
         # confirmed-hang tally must only ever count CONSECUTIVE failures.
         probe_fail_count_clear
-        [[ "$VERBOSE" == "true" ]] && report OK "IPC probe OK: ${probe_detail}."
+
+        # #5944: independently, record this SUCCESS into the windowed/rate
+        # history too — unlike the consecutive tally above, a single success
+        # must NOT erase it (see "A WINDOWED/RATE FAILURE SIGNAL" in the
+        # header, and probe_window_record()'s own comment).
+        probe_window_record "$live_pid" 0
+        if (( PROBE_WINDOW_FAIL_COUNT >= PROBE_WINDOW_FAIL_THRESHOLD )); then
+            load_avg="$(get_load_average)"
+            report DEGRADED \
+                "daemon IPC round-trip OK this tick (${probe_detail}), but ${PROBE_WINDOW_FAIL_COUNT} of the last ${PROBE_WINDOW_LEN} watchdog ticks failed the same probe (window threshold ${PROBE_WINDOW_FAIL_THRESHOLD}/${PROBE_WINDOW_TICKS}, #5944) — none of them were 3 CONSECUTIVE, so neither the same-tick (#5790) nor sustained-CONFIRMED (#4398) signal fired for this pattern, but failures this frequent are not a clean bill of health either. Host load average at probe time: ${load_avg}. NOT a confirmed hang (this tick's own round-trip answered) and no remediation is attempted; the window ages out on its own as old ticks roll off, and a run of clean ticks lets it clear naturally."
+            PROBE_DIVERGED=true
+            PROBE_DIVERGED_NOTE="the IPC probe has failed ${PROBE_WINDOW_FAIL_COUNT} of the last ${PROBE_WINDOW_LEN} watchdog ticks (see the DEGRADED line above, #5944) — dispatch may be intermittently degraded despite THIS tick's own round-trip succeeding; the exit code for this tick reflects that windowed/rate signal, not this line."
+        else
+            [[ "$VERBOSE" == "true" ]] && report OK "IPC probe OK: ${probe_detail}."
+        fi
         ;;
     unresponsive)
         probe_fail_streak=$(( $(probe_fail_count_for_pid "$live_pid") + 1 ))
         probe_fail_count_write "$live_pid" "$probe_fail_streak"
+        # #5944: also feed this FAILURE into the windowed/rate history — its
+        # own DEGRADED verdict only ever fires from the `healthy` branch above
+        # (a tick that already reports DIVERGENCE below needs no additional
+        # signal), but the failure must still be recorded so a LATER
+        # succeeding tick can see it in its window.
+        probe_window_record "$live_pid" 1
+        # #5790: sampled once per divergence, not per tick overall — healthy
+        # and skipped ticks never pay for it. Attached to BOTH the CONFIRMED
+        # and sub-threshold DIVERGENCE reports below so an operator can see at
+        # a glance whether the failure correlates with host contention (#4279)
+        # or occurred on an otherwise-idle host.
+        load_avg="$(get_load_average)"
         if (( probe_fail_streak >= PROBE_FAIL_THRESHOLD )); then
             # CONFIRMED, SUSTAINED hang. Deliberately report-only: there is no
             # provably-safe unattended remediation for a wedged-but-alive
@@ -1565,7 +2102,7 @@ case "$probe_verdict" in
             # narrow auto-kickstart gate this escalates to a maximally
             # actionable report and stops there.
             report DIVERGENCE \
-                "daemon IPC UNRESPONSIVE (CONFIRMED): the process is alive (${liveness_detail}) — and its heartbeat may well look FRESH — but the bounded socket round-trip has now failed on ${probe_fail_streak} CONSECUTIVE watchdog ticks (threshold ${PROBE_FAIL_THRESHOLD}). ${probe_detail}. The heartbeat writer and the IPC accept loop are independent tokio tasks, so a fresh heartbeat does NOT prove the daemon can still serve work: autonomous dispatch is effectively DEAD while this holds. No automatic kill/restart is attempted (#4398 — there is no provably-safe unattended remediation for a wedged-but-alive process). RECOVER: 'loom-daemon restart' (note: the restart primitive travels over this same wedged socket and may itself hang), else ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh [flags]. Diagnose with: LOOM_SOCKET_PATH=${SOCKET_PATH} ${PROBE_TIMEOUT_SECS}s-bounded 'loom-daemon status'; sample the process with 'sample ${live_pid}' (macOS) or 'gdb -p ${live_pid}' to capture the wedge before killing it."
+                "daemon IPC UNRESPONSIVE (CONFIRMED): the process is alive (${liveness_detail}) — and its heartbeat may well look FRESH — but the bounded socket round-trip has now failed on ${probe_fail_streak} CONSECUTIVE watchdog ticks (threshold ${PROBE_FAIL_THRESHOLD}). ${probe_detail}. Host load average at probe time: ${load_avg}. The heartbeat writer and the IPC accept loop are independent tokio tasks, so a fresh heartbeat does NOT prove the daemon can still serve work: autonomous dispatch is effectively DEAD while this holds. No automatic kill/restart is attempted (#4398 — there is no provably-safe unattended remediation for a wedged-but-alive process). RECOVER: 'loom-daemon restart' (note: the restart primitive travels over this same wedged socket and may itself hang), else ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh [flags]. Diagnose with: LOOM_SOCKET_PATH=${SOCKET_PATH} ${PROBE_TIMEOUT_SECS}s-bounded 'loom-daemon status'; sample the process with 'sample ${live_pid}' (macOS) or 'gdb -p ${live_pid}' to capture the wedge before killing it."
             exit 1
         fi
         # Below threshold: loud + logged, but explicitly NOT a confirmed hang —
@@ -1573,7 +2110,7 @@ case "$probe_verdict" in
         # per-connection task dropping a request under concurrent-sweep load
         # that the very next one answers).
         report DIVERGENCE \
-            "daemon IPC probe FAILED while the process is alive (${liveness_detail}): ${probe_detail}. This is consecutive failure ${probe_fail_streak} of ${PROBE_FAIL_THRESHOLD} — NOT yet a confirmed hang (a single failure can be transient contention under concurrent-sweep load, #4279) and no remediation is attempted. If the next watchdog tick round-trips cleanly the streak resets."
+            "daemon IPC probe FAILED while the process is alive (${liveness_detail}): ${probe_detail}. This is consecutive failure ${probe_fail_streak} of ${PROBE_FAIL_THRESHOLD} — NOT yet a confirmed hang (a single failure can be transient contention under concurrent-sweep load, #4279) and no remediation is attempted. Host load average at probe time: ${load_avg}. If the next watchdog tick round-trips cleanly the streak resets."
         PROBE_DIVERGED=true
         ;;
     *)
@@ -1584,6 +2121,37 @@ case "$probe_verdict" in
         [[ "$VERBOSE" == "true" ]] && report OK "IPC probe skipped: ${probe_detail}."
         ;;
 esac
+
+# ---------- peer-coordination out-of-band alert (#6222, Layer 3 of #6157) ----------
+# Only attempted on a tick whose own IPC evidence already says the daemon is
+# answering (`probe_verdict == healthy` — including the SOCKET_ONLY_LIVENESS
+# path above, which sets it directly): a tick that just failed or skipped its
+# OWN round-trip is not a good candidate to spend a second one on, and this
+# check must never become a new hang surface for the ticks that already are.
+if [[ "$probe_verdict" == "healthy" ]]; then
+    check_peer_coordination_health
+    case "$PEER_COORD_VERDICT" in
+        Degraded)
+            if [[ -f "$PEER_COORD_SENTINEL" ]]; then
+                report OK "peer-coordination degradation already escalated out-of-band (sentinel ${PEER_COORD_SENTINEL})."
+            elif escalate_peer_coordination_degraded; then
+                report DIVERGENCE "peer-claim coordination is DEGRADED: ${PEER_COORD_SUMMARY}. ESCALATED out-of-band: filed a forge tracking issue so this degradation is not confined to a logfile nobody tails (#6222)."
+            else
+                report DIVERGENCE "peer-claim coordination is DEGRADED: ${PEER_COORD_SUMMARY}. Out-of-band escalation was NOT possible (disabled, no create-issue.sh reachable, or the forge call failed) — THIS LOGFILE IS THE ONLY SIGNAL for this degradation, ${WATCHDOG_LOG}."
+            fi
+            ;;
+        Green)
+            if [[ -f "$PEER_COORD_SENTINEL" ]]; then
+                if clear_peer_coordination_escalation; then
+                    report OK "peer-claim coordination has RECOVERED (${PEER_COORD_SUMMARY}) — closed the tracking issue and cleared the escalation sentinel (#6222)."
+                else
+                    report WARN "peer-claim coordination has RECOVERED (${PEER_COORD_SUMMARY}) but closing/commenting the tracking issue failed — the sentinel is left in place so a later healthy tick retries (#6222)."
+                fi
+            fi
+            ;;
+        *) : ;; # could not determine this tick — not evidence either way
+    esac
+fi
 
 # Final exit for the paths below that find nothing wrong themselves. A probe
 # divergence already REPORTED above still owns the exit code — otherwise a
@@ -1626,7 +2194,7 @@ if [[ -f "$HEARTBEAT_FILE" ]]; then
         # degrades to the ordinary Stale/Fresh checks below rather than a
         # false claim either way. `proc_age` is computed once in section 3.
         if [[ -n "$proc_age" ]] && (( age > proc_age )); then
-            report OK "daemon alive (${liveness_detail}); heartbeat ${HEARTBEAT_FILE} is from a PREVIOUS boot (${age}s old; this process is only ${proc_age}s old) — not evidence about the current process. Liveness-only OK; re-check after the process is well past startup if you still suspect a wedge."
+            report_heartbeat_ok "daemon alive (${liveness_detail}); heartbeat ${HEARTBEAT_FILE} is from a PREVIOUS boot (${age}s old; this process is only ${proc_age}s old) — not evidence about the current process. Liveness-only OK; re-check after the process is well past startup if you still suspect a wedge."
             exit_ok
         fi
         if (( age > STALE_SECS )); then
@@ -1634,11 +2202,11 @@ if [[ -f "$HEARTBEAT_FILE" ]]; then
                 "Daemon process is alive (${liveness_detail}) but its heartbeat ${HEARTBEAT_FILE} is STALE (${age}s old > ${STALE_SECS}s threshold) — the daemon may be wedged. Inspect with 'loom-daemon status'; consider ./.loom/scripts/cli/loom-daemon-stop.sh && ...start.sh."
             exit 1
         fi
-        report OK "daemon healthy (${liveness_detail}); heartbeat fresh (${age}s ≤ ${STALE_SECS}s)."
+        report_heartbeat_ok "daemon healthy (${liveness_detail}); heartbeat fresh (${age}s ≤ ${STALE_SECS}s)."
         exit_ok
     fi
     # Unreadable mtime — degrade to liveness-only rather than false-report.
-    report OK "daemon alive (${liveness_detail}); heartbeat mtime unreadable — liveness-only OK."
+    report_heartbeat_ok "daemon alive (${liveness_detail}); heartbeat mtime unreadable — liveness-only OK."
     exit_ok
 fi
 
@@ -1646,5 +2214,5 @@ fi
 # disabled (LOOM_DAEMON_HEARTBEAT=0) or the daemon just started and has not
 # written yet. Degrade to liveness-only — do NOT false-report, since the daemon
 # clearly IS running.
-report OK "daemon alive (${liveness_detail}); no heartbeat file at ${HEARTBEAT_FILE} (heartbeat disabled or not yet written) — liveness-only OK."
+report_heartbeat_ok "daemon alive (${liveness_detail}); no heartbeat file at ${HEARTBEAT_FILE} (heartbeat disabled or not yet written) — liveness-only OK."
 exit_ok

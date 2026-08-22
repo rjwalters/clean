@@ -386,6 +386,121 @@ out="$(run_argv LOOM_CODEX_MODEL_CHECK=0 -- -p x -m sonnet)"
 assert_contains "-m sonnet" "$out" "LOOM_CODEX_MODEL_CHECK=0 disables the refusal"
 
 # ============================================================
+# Section 3c: ChatGPT-plan auth-mode guard for a pinned model (issue #5499)
+# ============================================================
+#
+# A ChatGPT-plan Codex profile only accepts its account's own default model —
+# even a Codex-family model (e.g. `gpt-5-codex`), which the Claude-shaped
+# refusal above never touches, still 400s on the wire. Verified against a fake
+# `codex` on PATH whose `login status` subcommand answers with the CLI's own
+# real wording (confirmed live against codex-cli 0.46.0: `codex login status`
+# prints exactly "Logged in using ChatGPT" / an API-key profile prints
+# "Logged in using an API key").
+
+echo ""
+echo "Testing spawn-codex.sh ChatGPT-plan auth-mode guard..."
+
+AUTHMODE_BIN="$TMPROOT/authmode-bin"
+mkdir -p "$AUTHMODE_BIN"
+AUTHMODE_ARGV_FILE="$TMPROOT/authmode-argv.txt"
+
+# mk_authmode_codex <login-status-line> — a fake codex that answers `login
+# status` with the given line, and otherwise behaves like the Section 8 mock
+# (records argv, emits a session id, exits 0).
+mk_authmode_codex() {
+    local status_line="$1"
+    cat > "$AUTHMODE_BIN/codex" <<MOCK
+#!/usr/bin/env bash
+if [[ "\$1" == "login" && "\$2" == "status" ]]; then
+    echo "$status_line"
+    exit 0
+fi
+printf '%s\n' "\$*" > "$AUTHMODE_ARGV_FILE"
+{
+  echo "session id: 00000000-0000-0000-0000-000000000000"
+  echo "tokens used"
+  echo "1"
+} >&2
+echo "AUTHMODE-FINAL"
+exit 0
+MOCK
+    chmod +x "$AUTHMODE_BIN/codex"
+}
+
+run_authmode() {
+    # usage: run_authmode [VAR=val ...] -- <args...>
+    local -a envs=()
+    while [[ $# -gt 0 && "$1" != "--" ]]; do envs+=("$1"); shift; done
+    shift || true
+    : > "$AUTHMODE_ARGV_FILE"
+    env -u LOOM_ROLE -u CODEX_HOME -u LOOM_CODEX_HOME -u LOOM_CODEX_PROFILE \
+        LOOM_SWEEP_NICE=0 LOOM_SPAWN_NO_EXPORT=1 PATH="$AUTHMODE_BIN:$PATH" \
+        ${envs[@]+"${envs[@]}"} \
+        bash "$SPAWN_CODEX" "$@" 2>&1
+}
+
+# (1) A ChatGPT-plan profile: the pinned Codex-family model is DROPPED with a
+# warning, and the CLI still runs successfully on its own default.
+mk_authmode_codex "Logged in using ChatGPT"
+out="$(run_authmode -- -p x -m gpt-5-codex)"
+assert_contains "authenticated via a ChatGPT plan" "$out" \
+    "a ChatGPT-plan profile with a pinned model warns about the auth-mode conflict"
+assert_contains "dropping the pinned model 'gpt-5-codex'" "$out" \
+    "the warning names the dropped model"
+assert_not_contains "-m gpt-5-codex" "$(cat "$AUTHMODE_ARGV_FILE")" \
+    "the pinned model is NOT forwarded to the ChatGPT-plan profile's codex invocation"
+assert_contains "AUTHMODE-FINAL" "$out" \
+    "the invocation still runs (on the account's own default) rather than being refused outright"
+
+# (2) An API-key profile: no conflict, the pinned model passes through
+# unchanged.
+mk_authmode_codex "Logged in using an API key"
+out="$(run_authmode -- -p x -m gpt-5-codex)"
+assert_not_contains "authenticated via a ChatGPT plan" "$out" \
+    "an API-key profile is never warned about the auth-mode conflict"
+assert_contains "-m gpt-5-codex" "$(cat "$AUTHMODE_ARGV_FILE")" \
+    "the pinned model IS forwarded to an API-key profile's codex invocation"
+
+# (3) No model pinned at all: the guard has nothing to check and never shells
+# out to `codex login status` (the mocked codex still errors if it did, since
+# only login status/argv-recording are implemented — passing here already
+# proves it wasn't invoked in an unexpected shape).
+mk_authmode_codex "Logged in using ChatGPT"
+out="$(run_authmode -- -p x)"
+assert_not_contains "authenticated via a ChatGPT plan" "$out" \
+    "no pinned model means nothing to drop — the guard is a no-op"
+
+# (4) Escape hatch: LOOM_CODEX_AUTH_MODE_CHECK=0 keeps the pin even against a
+# ChatGPT-plan profile.
+mk_authmode_codex "Logged in using ChatGPT"
+out="$(run_authmode LOOM_CODEX_AUTH_MODE_CHECK=0 -- -p x -m gpt-5-codex)"
+assert_not_contains "authenticated via a ChatGPT plan" "$out" \
+    "LOOM_CODEX_AUTH_MODE_CHECK=0 disables the guard"
+assert_contains "-m gpt-5-codex" "$(cat "$AUTHMODE_ARGV_FILE")" \
+    "the pinned model survives with the guard disabled"
+
+# (5) LOOM_CODEX_NO_EXEC=1 (argv-preview mode) never shells out to the real
+# CLI at all — the guard is skipped and the previewed argv still shows the
+# pin, consistent with the mode's "never touch the real CLI" contract.
+mk_authmode_codex "Logged in using ChatGPT"
+out="$(env -u LOOM_ROLE -u CODEX_HOME -u LOOM_CODEX_HOME -u LOOM_CODEX_PROFILE \
+    LOOM_SWEEP_NICE=0 LOOM_CODEX_NO_EXEC=1 LOOM_SPAWN_NO_EXPORT=1 \
+    PATH="$AUTHMODE_BIN:$PATH" bash "$SPAWN_CODEX" -p x -m gpt-5-codex 2>&1)"
+assert_contains "-m gpt-5-codex" "$out" \
+    "LOOM_CODEX_NO_EXEC=1 previews the pin unchanged (the guard never shells out under NO_EXEC)"
+
+# (6) The `-m=value` / `--model` / `--model=value` forms are all stripped too,
+# and every OTHER passthrough arg survives the filter.
+mk_authmode_codex "Logged in using ChatGPT"
+out="$(run_authmode -- -p x --model gpt-5-codex --effort high -s workspace-write)"
+assert_not_contains "gpt-5-codex" "$(cat "$AUTHMODE_ARGV_FILE")" \
+    "--model <value> (long form) is stripped too"
+assert_contains "model_reasoning_effort=high" "$(cat "$AUTHMODE_ARGV_FILE")" \
+    "a sibling passthrough arg (--effort) survives the model filter"
+assert_contains "workspace-write" "$(cat "$AUTHMODE_ARGV_FILE")" \
+    "a sibling passthrough arg (-s) survives the model filter"
+
+# ============================================================
 # Section 4: git-repo trust check (live-CLI behavior)
 # ============================================================
 
@@ -795,6 +910,16 @@ assert_classify "FATAL" \
 assert_classify "FATAL" "landlock_sandbox_executable_not_provided" 1 codex \
     "an unconstructable sandbox is FATAL (never silently retried unsandboxed)"
 
+# A ChatGPT-plan seat rejecting a pinned model is FATAL, not RECOVERABLE
+# (issue #5499) — retrying the identical invocation can never succeed; the
+# fault is the model/auth-mode pairing, not the transport.
+assert_classify "FATAL" \
+    "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.\"}}" \
+    1 codex "a ChatGPT-account model-unsupported 400 is FATAL, not RECOVERABLE (#5499)"
+assert_classify "FATAL" \
+    "The 'sonnet' model is not supported when using Codex with a ChatGPT account." \
+    1 codex "the same wording for a different pinned model is also FATAL (#5499)"
+
 # --- TOKEN_EXPIRED: 401 / login / refresh-token failures ---
 assert_classify "TOKEN_EXPIRED" \
     "ERROR codex_api: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses" \
@@ -878,6 +1003,9 @@ assert_classify "SUCCESS" "500 rate limit" 0 claude \
 assert_classify "RECOVERABLE" \
     "Not inside a trusted directory and --skip-git-repo-check was not specified." \
     1 claude "the codex FATAL patterns do NOT leak into the claude table"
+assert_classify "RECOVERABLE" \
+    "The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account." \
+    1 claude "the #5499 ChatGPT-account FATAL pattern does NOT leak into the claude table"
 
 # Two-arg calls (claude-wrapper.sh) and unknown providers are unaffected.
 assert_eq "TOKEN_EXHAUSTED" "$(classify_error "You've hit your weekly limit" 1)" \
@@ -1142,6 +1270,89 @@ set -e
 assert_eq "0" "$promoted_rc" "doctor + codex is admitted once the manifest declares the capability"
 
 rm -rf "$HOOKTMP"
+
+# ============================================================
+# Section 12: account-provider resolution from the runtime manifest
+#             (issue #5609, design D8)
+# ============================================================
+
+echo ""
+echo "Testing spawn-codex.sh account-provider resolution from the runtime manifest..."
+
+if command -v jq >/dev/null 2>&1; then
+    PROVIDER_WS="$(mktemp -d)"
+    mkdir -p "$PROVIDER_WS/.loom/runtimes"
+
+    PROVIDER_BIN="$TMPROOT/provider-bin"
+    mkdir -p "$PROVIDER_BIN"
+
+    # Fake profile directory the stub daemon hands back via CODEX_HOME —
+    # just enough for the auth.json presence check downstream of selection.
+    FAKE_PROFILE="$TMPROOT/fake-codex-profile"
+    mkdir -p "$FAKE_PROFILE"
+    echo '{"token":"stub"}' > "$FAKE_PROFILE/auth.json"
+
+    PROVIDER_ARGV_LOG="$TMPROOT/provider-argv.log"
+
+    cat > "$PROVIDER_BIN/loom-daemon" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == "tokens" && "\$2" == "select" && "\$3" == "--help" ]]; then
+    echo "--provider <PROVIDER>"
+    exit 0
+fi
+if [[ "\$1" == "tokens" && "\$2" == "select" ]]; then
+    printf '%s\n' "\$*" > "$PROVIDER_ARGV_LOG"
+    echo "export CODEX_HOME='$FAKE_PROFILE'"
+    echo "export LOOM_ACCOUNT_PROVIDER='codex'"
+    echo "export LOOM_ACCOUNT_NAME='stub-account'"
+    echo "LOOM_TOKEN_MODE='inventory'"
+    exit 0
+fi
+echo "unexpected loom-daemon invocation: \$*" >&2
+exit 1
+STUB
+    chmod +x "$PROVIDER_BIN/loom-daemon"
+
+    cat > "$PROVIDER_BIN/codex" <<'STUB'
+#!/usr/bin/env bash
+echo "stub-codex ran: $*"
+exit 0
+STUB
+    chmod +x "$PROVIDER_BIN/codex"
+
+    run_provider_select() {
+        rm -f "$PROVIDER_ARGV_LOG"
+        env -u CODEX_HOME -u LOOM_CODEX_HOME -u LOOM_CODEX_PROFILE -u LOOM_CODEX_NO_EXEC \
+            -u LOOM_SPAWN_NO_EXPORT -u LOOM_ROLE \
+            LOOM_SWEEP_NICE=0 \
+            LOOM_WORKSPACE="$PROVIDER_WS" LOOM_DAEMON_BIN="$PROVIDER_BIN/loom-daemon" \
+            PATH="$PROVIDER_BIN:$PATH" \
+            bash "$SPAWN_CODEX" -p "hi" >/dev/null 2>&1 || true
+        cat "$PROVIDER_ARGV_LOG" 2>/dev/null || echo "<no selection call captured>"
+    }
+
+    # codex.json ships "accountProvider": "codex" -> passed through verbatim
+    # (byte-identical to the pre-#5609 hardcoded behavior).
+    cat > "$PROVIDER_WS/.loom/runtimes/codex.json" <<'JSON'
+{"runtime": "codex", "accountProvider": "codex"}
+JSON
+    argv="$(run_provider_select)"
+    assert_contains "--provider codex" "$argv" \
+        "spawn-codex.sh passes the manifest's accountProvider (codex) to tokens select (#5609)"
+
+    # A runtime manifest present but missing the accountProvider field falls
+    # back to claude (D8's fail-open default), never fails closed.
+    cat > "$PROVIDER_WS/.loom/runtimes/codex.json" <<'JSON'
+{"runtime": "codex"}
+JSON
+    argv="$(run_provider_select)"
+    assert_contains "--provider claude" "$argv" \
+        "a runtime manifest with no accountProvider field defaults to claude (#5609)"
+
+    rm -rf "$PROVIDER_WS"
+else
+    echo "  SKIP: jq unavailable — account-provider resolution needs it"
+fi
 
 # ============================================================
 # Summary

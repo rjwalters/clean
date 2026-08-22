@@ -119,6 +119,27 @@ fi
   or a feature-flag-specific job) — the extraction above only needs the
   general-purpose `--workspace` suite; it is not meant to replicate every job.
 
+**Before running `$TEST_CMD` directly on THIS host, route it through the
+nextest live-daemon guard if this repo has one (#6528)** — see Step D5 below
+for why: some nextest test groups can be as HOST-MUTATING as the shell suites
+already covered there.
+
+```bash
+NEXTEST_GUARD="defaults/scripts/tests/nextest-daemon-guard.sh"
+if [[ -n "${NEXTEST_CMD:-}" && -x "$NEXTEST_GUARD" ]]; then
+    # --resolve prints the command to actually run: unchanged when this host
+    # has no live-daemon evidence, or with the two host-mutating binaries
+    # excluded (-E 'not binary(...) and not binary(...)') when it does. Guard
+    # evidence (if any) is printed to stderr by the guard itself — surface
+    # it, don't swallow it.
+    TEST_CMD="$(bash "$NEXTEST_GUARD" --resolve "$TEST_CMD")"
+fi
+```
+
+If this repo has no `nextest-daemon-guard.sh` (i.e. it isn't the Loom repo
+itself), run the extracted `$TEST_CMD` as-is — this guard is specific to the
+`daemon-integration` test group defined in Loom's own `.config/nextest.toml`.
+
 **Step D2 — detect the launchable artifact (what does "run it" mean here?):**
 
 - CLI/daemon binary under `target/release/…` or a `bin`/`scripts` entrypoint →
@@ -159,6 +180,113 @@ build/launch" and stand down (or run only the cheap validation). Note the
 skipped heavy validation in your report so the gap is visible; do **not** file a
 bug just because heavy validation was skipped by policy.
 
+**Step D5 — some suites are HOST-MUTATING: never run them directly (#6386,
+#6528):**
+
+Most test suites are hermetic. A few are not: this repo's **daemon-lifecycle
+shell suites** (`test-loom-daemon-start.sh`, `-stop.sh`, `-update.sh`,
+`-quiesce.sh`, `-watchdog.sh`) execute the *real* `loom-daemon-{start,stop,
+update,quiesce}.sh`, so they `kill`, `rm -f` pid files, and `launchctl bootout` /
+`systemctl --user disable` whatever their invocations resolve. The Rust
+`daemon-integration` nextest group (`integration_security.rs`,
+`integration_factory_reset.rs`) is the same hazard class from a second entry
+point — see the dedicated subsection below, after the shell-suite rules.
+
+**Two things make you, specifically, the dangerous caller:**
+
+1. You run on a **fleet host**, where a live `loom-daemon` and its pid file both
+   exist — unlike CI, where neither does, so CI can never see this hazard.
+2. Your own agent session **exports the live state paths** into every child
+   process you spawn (`LOOM_PID_FILE=<the real .daemon.pid>`, `LOOM_WORKSPACE=<the
+   real checkout>`, `LOOM_LAUNCHD_LABEL=com.rjwalters.loom-daemon`). A suite that
+   merely *omits* an override does not get a neutral default — it inherits
+   production. And your cwd is normally the live checkout, which is the *other*
+   resolution tier.
+
+On 2026-08-16 that combination cost the fleet its authoritative dispatcher for
+11 hours: an idle-triggered Auditor ran `bash defaults/scripts/tests/run-ci-suites.sh`
+from the live checkout, one stop-suite case resolved the real `.loom/.daemon.pid`,
+and the daemon was SIGTERM'd (#6386).
+
+**The rules:**
+
+- Run the shell suites **only** through `defaults/scripts/tests/run-ci-suites.sh`,
+  never by invoking a `test-loom-daemon-*.sh` file directly. That runner carries
+  the live-daemon guard: when a daemon pid file exists on this host it **skips**
+  those five suites, loudly, and says so in its summary.
+- **Never set `LOOM_CI_ALLOW_DAEMON_SUITES=1`.** That override exists for an
+  operator on a host with no daemon; for you it re-opens exactly this hazard.
+- A `SKIP … (live-daemon guard, #6386)` line is a **correct outcome**, not a
+  failure. Report those suites as "not validated on this host (live daemon
+  present)" — do **not** file a bug, and do **not** work around the guard.
+- Treat the same way any suite in another repo that drives a service lifecycle,
+  a supervisor (launchd/systemd), or a shared daemon: if you cannot show it is
+  hermetic, do not run it on a host where that service is live.
+
+**The Rust `daemon-integration` nextest group is the same hazard class, from a
+second entry point (#6528):** `cargo nextest run --workspace --profile ci` —
+the exact command Step D1's Rust extraction hands you as `$TEST_CMD` — runs
+`integration_security.rs` and `integration_factory_reset.rs`, whose `setup()`
+calls `cleanup_all_loom_sessions()`. That kills **every** `loom-*` tmux
+session on the shared, host-global `-L loom` socket — including a live
+production `loom-daemon`'s own tracked sessions and any real agent sessions,
+not just other test binaries' (a reviewed, accepted-for-**CI** exception,
+#4622 — CI has no live daemon and no real sessions to lose, so that
+acceptance is unaffected; this is about YOU running the same command
+directly, on a live fleet host).
+
+- Step D1's Rust extraction already routes `$TEST_CMD` through
+  `defaults/scripts/tests/nextest-daemon-guard.sh --resolve` when that script
+  exists in this repo — **never bypass it** by hand-assembling and running
+  the raw `cargo nextest run --workspace …` line yourself. The guard uses the
+  same pid-file detection as the shell-suite guard above
+  (`defaults/scripts/lib/live-daemon-guard.sh`): when a daemon pid file
+  exists on this host, it excludes the two host-mutating binaries via `-E
+  'not binary(integration_security) and not binary(integration_factory_reset)'`
+  instead of running them; otherwise `$TEST_CMD` is returned unchanged.
+- An excluded-binaries run is a **correct outcome**, not a failure. Report
+  `integration_security`/`integration_factory_reset` as "not validated on
+  this host (live daemon present)" — do **not** file a bug, and do **not**
+  work around the guard by invoking those two binaries' package/binary
+  directly to "just check".
+- `integration_basic` is a related but DIFFERENT case (#6607): the guard
+  never excludes it (it is non-destructive — `cleanup_test_sessions()`, not
+  `cleanup_all_loom_sessions()`), but it drives the SAME shared `-L loom`
+  tmux socket a live daemon uses, so it can flake with `Timeout reading
+  response` / `deadline has elapsed` under that contention on a live-daemon
+  host. If it fails on such a host, do **not** file a bug from that single
+  run — re-run on a host with no live daemon (e.g. CI) first; only file if it
+  still fails there.
+- If `nextest-daemon-guard.sh` does not exist in a repo you are auditing (it
+  is Loom-specific), this subsection does not apply there — but apply the
+  same reasoning to any Rust test group in that repo whose setup/teardown
+  touches shared host state (a tmux/screen server, a real daemon, a shared
+  port or lock file): if you cannot show it is hermetic, do not run it
+  directly on a host where that state is live.
+
+**`npm run check:all` / `pnpm test` is a THIRD entry point to the same
+hazard (#6554) — Step D1's own Node+Rust guidance can walk you into it.**
+This repo's root `package.json` `test` script is the plain `cargo test
+--workspace ...` invocation, not nextest — Step D1's "package.json ->
+node/pnpm/npm build+test" fallback and CI's own "full-stack check" job both
+run it via `npm run check:all`, independently of whatever `$TEST_CMD` the
+Rust-extraction steps above computed. In THIS repo that script is now itself
+guarded: it is `defaults/scripts/tests/cargo-test-daemon-guard.sh "cargo test
+--workspace ..."`, which applies the same live-daemon detection and — when a
+daemon pid file is found — excludes `integration_security`/
+`integration_factory_reset` (splitting the invocation across
+`--exclude loom-daemon` plus a `-p loom-daemon` re-run with those two targets
+left out of an explicit `--test` allowlist, since plain `cargo test` has no
+nextest-style `-E` filter). So running `npm run check:all` / `pnpm test`
+directly in this repo is safe as shipped — you do not need to route it
+through anything yourself. **In another Node+Rust repo you are auditing**,
+this guard is Loom-specific and will not exist: before running that repo's
+own `package.json` `test`/`check:all` script, check whether it wraps `cargo
+test`/`cargo nextest` against a package with daemon/service/shared-state
+integration tests, the same way you would vet any other Rust test group in
+Step D5 above — a Node wrapper script is not evidence of hermeticity by
+itself.
+
 ### CI-Aware Validation
 
 **Before running redundant build/test, check if CI already validated the commit.**
@@ -191,6 +319,62 @@ case $CI_STATUS in
         ;;
 esac
 ```
+
+### Docker-Dependent CI Legs (no local docker)
+
+Some repos run a CI leg that builds/runs a docker image (e.g. this repo's
+`worker-image-smoke` job, which builds and smoke-tests the `loom-worker`
+image). **Do not silently skip that leg just because `docker` is unavailable
+on this host** — look up the job's own real conclusion from the forge instead
+of building the image yourself (provisioning `docker` on the Auditor host is
+out of scope, #5748):
+
+```bash
+if ! command -v docker &>/dev/null; then
+    # No docker on this host — query the specific job's conclusion instead of
+    # silently omitting that leg. Use the exact GitHub Actions job `name:`
+    # (not the workflow-file job id) — e.g. "loom-worker Image Smoke Test"
+    # for this repo's worker-image-smoke job.
+    ./.loom/scripts/check-ci-status.sh --job "loom-worker Image Smoke Test" --quiet
+    JOB_STATUS=$?
+    case $JOB_STATUS in
+        0) echo "worker-image-smoke: PASSED (per CI, not locally validated — no docker on this host)" ;;
+        1) echo "worker-image-smoke: FAILED per CI — investigate/file a bug" ;;
+        2) echo "worker-image-smoke: still pending in CI" ;;
+        *) echo "worker-image-smoke: not applicable for this commit or no docker CI job on this forge (Gitea has none) — report as N/A, not pass/fail" ;;
+    esac
+    # Always mention this leg's status explicitly in the audit output —
+    # never complete the audit without reporting it, whichever branch above ran.
+else
+    # docker IS available — this is unchanged: build the image and run the
+    # repo's own smoke-test script locally (e.g. docker/worker/test-image.sh
+    # in this repo) instead of only trusting CI's report of it.
+    :
+fi
+```
+
+Exit code `3` from `--job` covers two distinct forge-reported states —
+`--quiet` distinguishes them by printed string (`not_found` vs `skipped`) if
+you need to tell them apart in the audit output: the job never ran for this
+commit at all (e.g. a Gitea repo, which has no such GitHub Actions job), or
+it ran but its own `if:` condition evaluated false for this commit (e.g. a
+non-push event where the docker-changed-files gate skipped it). Report
+either as "not applicable", never as a false pass or fail.
+
+**Docker present but host/target architecture mismatch**: some Dockerfiles
+(e.g. this repo's `docker/worker/Dockerfile`) `COPY` a pre-built binary for a
+specific target triple — `dist/loom-daemon-x86_64-unknown-linux-gnu` — rather
+than building it from source inside the image (artifact-reuse design, #5325).
+On a host whose `cargo build --release` output doesn't match that triple
+(e.g. an arm64 Auditor host, which produces a Mach-O arm64 binary, not the
+required ELF x86_64 one), the leg cannot be genuinely locally validated even
+though `docker` itself is installed and working (#5765). Treat this the same
+as the "no local docker" case above: fall back to
+`./.loom/scripts/check-ci-status.sh --job "loom-worker Image Smoke Test"
+--quiet` and report the leg as "passed per CI, not locally validated
+(host/target arch mismatch)" — do not attempt (and fail) a local `docker
+build` / `test-image.sh` run that you already know cannot produce the
+required artifact.
 
 ### Standard Validation Workflow
 
@@ -532,6 +716,20 @@ jq -c 'select(.pattern == "<pattern>")' .loom/logs/guard-decisions.log | tail -3
 - **Keep flagged** — the op is genuinely dangerous or irreversible (recursive-force-remove of root/`$HOME`/out-of-repo, force-push to `main`/`master`, `gh repo delete`/`archive`, fork bomb, pipe-curl-to-shell, cloud destruction, secrets exfil, or the uncommitted-loss `git checkout .`/`git restore .`/`git clean -fd` family). Confirm the guard should stand; close the loop so the same trigger is not re-filed.
 
 **Label discipline:** file these as normal issues that enter through intake (`loom:triage`) or as `loom:auditor` proposals for Champion evaluation — **never self-apply `loom:issue`** (promotion ownership: see `.loom/roles/curator.md` § "Who promotes `loom:curated` → `loom:issue`"). The genuinely-dangerous set MUST remain `DENY`/`ASK`; the standing policy only ever refines *false positives*, never relaxes a real safety floor.
+
+## Bounded Rejection-Review (Standing Policy, #5859)
+
+Each tick, read the Judge rejections that landed since your last pass and watch for a **recurring process pattern** — a class of mistake a role prompt could prevent — as distinct from a one-off code-specific finding that needs no action (design rationale: `docs/design/retrospective-pattern-mining.md` §8, #5850).
+
+**Workflow (run each tick):**
+
+1. List `loom:changes-requested` label-**add** events since the last pass — index on the **event**, not the `<!-- loom:verdict-sha ... -->` comment marker: the marker was measured at ~50% recall while the label event is server-generated and therefore exact (#5850 §2, §4).
+2. Join each event to its verdict comment: the newest comment strictly preceding the event within 120s (`judge.md` chains the comment write and the label write with `&&`, so the gap is bounded — measured at 1–8s).
+3. Classify each pair as a **code-specific finding** (no action) or a **process pattern**.
+4. Keep the running tally in the pass's own issue/comment trail — **no new state file**, the forge is the state store.
+5. File a proposal only once the same pattern reaches **three or more independent instances**, citing the specific PR numbers.
+
+**Dedupe, label discipline, and safety floor:** identical to the Guard-Decision Telemetry Review above — dedupe with `./.loom/scripts/check-duplicate.sh`, file via `./.loom/scripts/create-issue.sh` (never a direct edit to `.loom/roles/*.md`, `CLAUDE.md`, or `.github/labels.yml`), enter at `loom:triage`/`loom:auditor` and never self-apply `loom:issue`, and never propose relaxing a safety rule, guard, label invariant, or lifecycle gate. Additionally, a proposal that adds lines to a prompt must say what it displaces, and proposing a deletion must be an available verdict — `CLAUDE.md` and `judge.md` are already near their prompt-budget ceilings.
 
 ## Decision Framework
 
