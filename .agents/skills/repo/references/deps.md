@@ -112,8 +112,9 @@ the authoritative source either way.
 ### 2. Detect the ecosystems actually present
 
 Scaffold from what the repo really contains, never from a fixed template. Look
-for manifests at the root **and** in subdirectories (each distinct directory
-needs its own `updates:` entry with the right `directory:` value):
+for manifests at the root **and** in subdirectories (every distinct directory
+needs coverage — either its own `updates:` entry with the right `directory:`
+value, or a slot in one entry's plural `directories:` list, see below):
 
 | Ecosystem | Detect via |
 |---|---|
@@ -143,6 +144,17 @@ not save you — zsh fails before `ls` ever runs.
 
 If **nothing** is detected, say there is nothing to scaffold and stop — do not
 guess an ecosystem the repo doesn't have.
+
+**One ecosystem in many directories**: when the same ecosystem appears in
+several places (say, four independent crates, each with its own `Cargo.toml`
+and `Cargo.lock`, under one directory tree), Dependabot's plural `directories:`
+key collapses them into a **single** `updates:` entry instead of N
+near-identical ones. Scans still open one PR per directory — the key changes
+how the config is written, not how many PRs arrive. The trade-off is that one
+entry means **one shared policy**: the same schedule, grouping, `labels:`, and
+`exclude-patterns` apply to every listed directory. Keep separate
+per-directory entries whenever two manifests genuinely need different grouping
+or cadence. Syntax in step 4.
 
 #### 2a. Classify each manifest as repo-owned or installer-owned
 
@@ -306,6 +318,30 @@ updates:
         update-types: ["minor", "patch"]
     # majors are deliberately ungrouped: one reviewable PR each
 ```
+
+For an ecosystem step 2 found in several directories, use the plural
+`directories:` key **in place of** `directory:` — a list of paths (globs
+allowed) sharing one entry's schedule, grouping, and labels:
+
+```yaml
+  - package-ecosystem: "cargo"
+    directories:                       # plural — several manifests, one policy
+      - "/crates/alpha"
+      - "/crates/beta"
+      - "/crates/gamma"
+    schedule:
+      interval: "weekly"
+    groups:
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+```
+
+Expect one PR per directory on the first scan even though there is only one
+entry — `directories:` shares the *policy*, not the PRs. Split it back into
+per-directory entries the moment two of those crates need different grouping,
+cadence, or labels: `directories:` buys brevity, and pays for it with a single
+shared policy across every path listed.
 
 Add `labels: ["<validated-label>"]` only if step 3 approved one. Write the file
 only on explicit approval; under `--check`, stop here and show it as a proposal.
@@ -545,6 +581,27 @@ when the branch is linked to a worktree:
 ./.loom/scripts/merge-pr.sh <N>      # Loom repos
 gh pr merge <N> --squash             # otherwise
 ```
+
+**Re-poll mergeability between sequential merges.** Merging one bot PR that
+touches a shared lockfile invalidates its siblings: GitHub recomputes their
+mergeability asynchronously, and for ~20 s the remaining PRs report
+`mergeable: null` / `mergeable_state: "unknown"` (`mergeStateStatus: UNKNOWN`
+via `gh`) before settling back to `clean`. `merge-pr.sh` refuses inside that
+window, which reads as a spurious failure mid-loop. After each merge, re-read
+the next PR's state and wait for `clean` before merging it:
+
+```bash
+for _ in $(seq 1 12); do
+  state=$(gh pr view <N> --json mergeStateStatus -q .mergeStateStatus)
+  [ "$state" = "UNKNOWN" ] || break
+  sleep 5
+done
+echo "$state"   # CLEAN → merge; DIRTY/BLOCKED → real conflict or failing checks, re-triage
+```
+
+A state that settles on `DIRTY` (or `BLOCKED`) is **not** a timing artifact —
+the earlier merge produced a genuine lockfile conflict, so stop the loop and
+report it rather than retrying.
 
 Under `--check`, stop at the report and merge nothing.
 
