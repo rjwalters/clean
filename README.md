@@ -66,7 +66,7 @@ To uninstall: `./install.sh --uninstall`.
 
 ```bash
 clean              # Run cleanup
-clean --check      # Preview what would be cleaned (dry run)
+clean --check      # Preview what would be cleaned (dry run); short form -c (-a for --aggressive)
 clean --aggressive # Also run 'docker system prune -af --volumes'
 clean --system-only # Skip per-project cleanup
 clean --help       # Show detailed help
@@ -94,6 +94,7 @@ Edit the variables at the top of `cleanup.sh`:
 | Variable | Default | Description |
 |---|---|---|
 | `VENV_AGE_DAYS` | `7` | Min age before cleaning virtualenvs |
+| `NODE_MODULES_AGE_DAYS` | `7` | Min idle time (recursive, of the **project**) before cleaning `node_modules`/`.next` |
 | `TMP_AGE_HOURS` | `1` | Min idle time (recursive) before cleaning /tmp clones |
 | `WORKTREE_AGE_DAYS` | `14` | Min idle time (recursive) before cleaning agent worktrees |
 | `PYCACHE_AGE_DAYS` | `14` | Min age before cleaning Python caches |
