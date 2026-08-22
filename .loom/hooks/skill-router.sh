@@ -5,9 +5,12 @@
 # Receives JSON on stdin with { "prompt": "...", "session_id": "...", "cwd": "..." }
 #
 # Behavior:
-#   1. Always injects a compact agent routing table as additionalContext
-#   2. Optionally emits an AGENT_ROUTE directive when prompt strongly matches
-#      a domain pattern (first match wins)
+#   1. Emits nothing unless the prompt strongly matches a domain route pattern
+#      (first match wins). Non-matching turns produce NO additionalContext —
+#      the agent table is no longer injected on every prompt (issue #3609).
+#   2. On a match, emits an AGENT_ROUTE directive. A compact agent routing
+#      table is appended at most ONCE per session, deduped via the session_id
+#      present on stdin (a missing session_id degrades to per-match inclusion).
 #
 # Output format (Claude Code hooks spec):
 #   { "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "additionalContext": "..." } }
@@ -48,6 +51,10 @@ fi
 # Extract prompt
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null) || PROMPT=""
 
+# Extract session_id (used for once-per-session table dedup; optional — a
+# missing/empty value degrades gracefully, see the PER-SESSION TABLE DEDUP block)
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null) || SESSION_ID=""
+
 # If no prompt, nothing to do
 if [[ -z "$PROMPT" ]]; then
     exit 0
@@ -55,6 +62,38 @@ fi
 
 # Skip orchestrator pulse prompts (start with /self)
 if [[ "$PROMPT" == /self* ]]; then
+    exit 0
+fi
+
+# Skip harness-generated task-notification turns. These are not human input —
+# the harness re-runs UserPromptSubmit hooks on every background-task completion,
+# and re-injecting the agent table / re-routing on them is pure noise.
+# Match against the raw prompt with literal prefix/substring (no regex) so this
+# guard cannot itself false-positive on human text.
+case "$PROMPT" in
+    "[SYSTEM NOTIFICATION"*) exit 0 ;;
+esac
+if [[ "$PROMPT" == *"<task-notification>"* ]]; then
+    exit 0
+fi
+
+# =============================================================================
+# MINIMUM-SIGNAL GATE (#3609)
+# =============================================================================
+# Skip turns that are structurally unlikely to be a routing request:
+#   - prompts that begin with '/' (slash-command turns, e.g. /builder,
+#     /loom:sweep — the user has already chosen a command)
+#   - very short prompts (< 3 words), which carry too little signal to route
+# These skips keep near-zero-signal chatter from producing routing noise.
+if [[ "$PROMPT" == /* ]]; then
+    exit 0
+fi
+
+WORD_COUNT=$(printf '%s' "$PROMPT" | wc -w | tr -d '[:space:]')
+if [[ -z "$WORD_COUNT" ]]; then
+    WORD_COUNT=0
+fi
+if [[ "$WORD_COUNT" -lt 3 ]]; then
     exit 0
 fi
 
@@ -94,18 +133,6 @@ if [[ -z "$ROUTES_JSON" ]] || [[ "$ROUTES_JSON" == "null" ]]; then
 fi
 
 # =============================================================================
-# BUILD AGENT TABLE
-# =============================================================================
-
-# Build compact agent routing table from config
-AGENT_TABLE=$(echo "$ROUTES_JSON" | jq -r '.[] | "\(.agent) — \(.description)"' 2>/dev/null) || AGENT_TABLE=""
-
-if [[ -z "$AGENT_TABLE" ]]; then
-    log_hook_error "Failed to build agent table"
-    exit 0
-fi
-
-# =============================================================================
 # PATTERN MATCHING
 # =============================================================================
 
@@ -134,19 +161,101 @@ for (( i=0; i<ROUTE_COUNT; i++ )); do
 done
 
 # =============================================================================
-# OUTPUT
+# ANTI-ROUTE SUPPRESSION (#5327)
+# =============================================================================
+# A prompt can hit a route pattern by keyword coincidence while explicitly
+# declining Loom involvement, e.g. "fix this yourself without loom" or "we
+# don't need to use loom for every tiny change" — both contain "fix" and would
+# otherwise route to /loom:doctor. Suppress the match when a decline phrase is
+# present, using literal (non-regex) substring checks against the full prompt
+# — literal so this guard, like the task-notification guard above, cannot
+# itself false-positive on ordinary human text.
+#
+# INVARIANT: every phrase below must mention "loom" explicitly. Bare
+# single-word phrases ("myself", "inline", "directly") suppress ordinary
+# prompts that never decline Loom at all — e.g. "review this PR directly" or
+# "clean up this code inline" — so they are deliberately excluded. Suppression
+# requires an explicit decline of Loom, never a stylistic adverb.
+if [[ -n "$MATCHED_AGENT" ]]; then
+    ANTI_ROUTE_PHRASES=(
+        "without loom"
+        "don't use loom"
+        "do not use loom"
+        "don't need to use loom"
+        "do not need to use loom"
+        "no need to use loom"
+        "no need for a loom"
+        "no loom"
+        "not use loom"
+        "not via loom"
+    )
+    for phrase in "${ANTI_ROUTE_PHRASES[@]}"; do
+        if [[ "$PROMPT_LOWER" == *"$phrase"* ]]; then
+            log_hook_error "Suppressed route to $MATCHED_AGENT: anti-route phrase '$phrase' matched"
+            MATCHED_AGENT=""
+            MATCHED_DESC=""
+            break
+        fi
+    done
+fi
+
+# No route matched: emit nothing at all (issue #3609). The agent table used to
+# ride along on EVERY prompt; now it only accompanies a genuine route match, so
+# non-matching turns are a silent exit — no additionalContext, no token cost.
+if [[ -z "$MATCHED_AGENT" ]]; then
+    exit 0
+fi
+
+# =============================================================================
+# PER-SESSION TABLE DEDUP (#3609)
+# =============================================================================
+# The agent table is verbatim repetition of the roles list already shipped in
+# CLAUDE.md, so a session needs it at most once. We key an "already sent" marker
+# on the session_id already present on stdin. A missing/empty session_id
+# degrades gracefully: we cannot dedup, so the table is included on each match
+# (the pre-#3609 per-turn behavior, but now only on matching turns).
+
+INCLUDE_TABLE=1
+if [[ -n "$SESSION_ID" ]]; then
+    # Sanitize to filename-safe characters so the marker is a single predictable
+    # file (never a path traversal, never a nested directory).
+    SESSION_KEY=$(printf '%s' "$SESSION_ID" | tr -c 'A-Za-z0-9._-' '_')
+    SEEN_DIR="${MAIN_ROOT}/.loom/logs/skill-router-seen"
+    SEEN_MARKER="${SEEN_DIR}/${SESSION_KEY}"
+    # Opportunistic best-effort prune (#3793): every session adds one marker here
+    # and nothing else prunes them, so a busy orchestration repo would accumulate
+    # stale empty files without bound. Drop markers older than 7 days on hook
+    # entry. Fail-open — any error (missing dir, permission) never fails the hook
+    # and never changes the dedup decision below.
+    find "$SEEN_DIR" -type f -mtime +7 -delete 2>/dev/null || true
+    if [[ -f "$SEEN_MARKER" ]]; then
+        INCLUDE_TABLE=0
+    else
+        # Best-effort marker creation; a failure here never fails the hook and
+        # simply means the table may be re-sent on a later matching turn.
+        mkdir -p "$SEEN_DIR" 2>/dev/null || true
+        : > "$SEEN_MARKER" 2>/dev/null || true
+    fi
+fi
+
+# =============================================================================
+# BUILD OUTPUT
 # =============================================================================
 
-# Build the additionalContext string
-CONTEXT="Available Loom agents:
-${AGENT_TABLE}"
+CONTEXT=""
+if [[ "$INCLUDE_TABLE" -eq 1 ]]; then
+    # Build the compact agent routing table only when we will actually emit it.
+    AGENT_TABLE=$(echo "$ROUTES_JSON" | jq -r '.[] | "\(.agent) — \(.description)"' 2>/dev/null) || AGENT_TABLE=""
+    if [[ -n "$AGENT_TABLE" ]]; then
+        CONTEXT="Available Loom agents:
+${AGENT_TABLE}
 
-if [[ -n "$MATCHED_AGENT" ]]; then
-    CONTEXT="${CONTEXT}
-
-AGENT_ROUTE: ${MATCHED_AGENT} — ${MATCHED_DESC}
-(This is a suggestion based on prompt keywords. Use the Skill tool to invoke if appropriate.)"
+"
+    fi
 fi
+
+CONTEXT="${CONTEXT}AGENT_ROUTE: ${MATCHED_AGENT} — ${MATCHED_DESC}
+(This is a suggestion based on prompt keywords. Use the Skill tool to invoke if appropriate.)"
 
 # Output valid JSON
 jq -n --arg context "$CONTEXT" '{

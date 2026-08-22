@@ -8,6 +8,18 @@
       "known_hosts": []
     }
   },
+  "runtimes": {
+    "default": "claude"
+  },
+  "safehouse": {
+    "enabled": false,
+    "socket": null,
+    "room": null,
+    "persona": "loom_daemon",
+    "workerPersonas": [],
+    "mcpCommand": "safehouse-mcp",
+    "peerClaimTtlSecs": 120
+  },
   "health_monitoring": {
     "enabled": true,
     "collect_interval_minutes": 5,
@@ -28,7 +40,11 @@
     "auto_create_issues": false,
     "min_session_duration": 300,
     "upstream_repo": "rjwalters/loom",
-    "categories": ["bug", "enhancement", "documentation"]
+    "categories": [
+      "bug",
+      "enhancement",
+      "documentation"
+    ]
   },
   "terminals": [
     {
