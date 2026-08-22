@@ -16,7 +16,7 @@ Cleans system caches, Docker resources, per-project build artifacts, and stale w
   with no open handles and no uncommitted/unpushed work
 
 **Per-project (auto-detected):**
-- `node_modules`, `.next`
+- `node_modules`, `.next` — only when the project itself has been idle >7 days
 - Python caches (`__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`) >14 days
 - Python virtualenvs (`venv`, `.venv`) >7 days
 - Rust `target/` directories >7 days
@@ -33,7 +33,10 @@ Cleans system caches, Docker resources, per-project build artifacts, and stale w
 ## Safety nets
 
 1. **Age thresholds** — never deletes trees with recent activity. Recursive for
-   git trees: an edit *anywhere* in the tree counts, not just the root dir's mtime
+   git trees: an edit *anywhere* in the tree counts, not just the root dir's mtime. For
+   `node_modules`/`.next` the age test is applied to the **project**, not to the
+   artifact: a `node_modules` installed months ago and built against hourly is
+   in use, and its own mtime cannot tell you that
 2. **Open-handle check** (`lsof`) — skips directories with active processes
 3. **Active worktree check** — never touches files inside live git worktrees
    (symlink-safe, so `/tmp` vs `/private/tmp` aliasing can't defeat it)
