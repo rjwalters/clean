@@ -41,6 +41,7 @@ VENV_AGE_DAYS=7
 TMP_AGE_HOURS=1              # /tmp clones must be at least this old
 PYCACHE_AGE_DAYS=14          # __pycache__ etc must be at least this old
 TARGET_AGE_DAYS=7            # rust target dirs must be at least this old
+NODE_MODULES_AGE_DAYS=7      # project must be idle this long before node_modules/.next go
 WORKTREE_AGE_DAYS=14         # non-issue agent worktrees must be at least this old
 CHECK_MODE=false
 AGGRESSIVE_MODE=false
@@ -70,7 +71,7 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "  • System logs >30 days old"
     echo ""
     echo "Per-project cleanup:"
-    echo "  • node_modules, .next"
+    echo "  • node_modules, .next (projects idle >$NODE_MODULES_AGE_DAYS days)"
     echo "  • Python caches (__pycache__, .pytest_cache, .ruff_cache) >$PYCACHE_AGE_DAYS days"
     echo "  • Python venvs (root + subdirs) >$VENV_AGE_DAYS days"
     echo "  • Rust target/ dirs (root + monorepo subdirs) >$TARGET_AGE_DAYS days"
@@ -202,6 +203,23 @@ has_recent_activity_hours() {
     local dir="$1"
     local hours="$2"
     [ -n "$(find "$dir" -mmin -"$(( hours * 60 ))" -print -quit 2>/dev/null)" ]
+}
+
+# Recursive activity check for a PROJECT, ignoring its own regenerable build
+# artifacts. Asking "is node_modules old?" answers the wrong question: its
+# mtime is stamped at install time and never bumped by use, so a tree installed
+# months ago and built against hourly looks stale. Ask instead whether the
+# PROJECT has been touched, which is what makes its dependencies load-bearing.
+# Heavy artifact dirs are pruned so the scan stays cheap and so a stale build
+# output cannot masquerade as activity; .git is deliberately NOT pruned, since
+# commits and fetches are activity (same rule has_recent_activity_days uses).
+has_recent_project_activity() {
+    local project="$1"
+    local days="$2"
+    [ -n "$(find "$project" \
+        \( -name node_modules -o -name .next -o -name target -o -name .venv \
+           -o -name venv -o -name .lake -o -name .gradle \) -prune \
+        -o -mtime -"$days" -print -quit 2>/dev/null)" ]
 }
 
 # Returns 0 (true) if the git repo/worktree at $1 holds work that exists
@@ -540,10 +558,26 @@ echo "              PROJECT CLEANUP ($PROJECT_DIR)"
 echo "═══════════════════════════════════════════════════════════"
 echo ""
 
-# Node.js caches
-echo "📦 Node.js caches (node_modules, .next)..."
+# Node.js caches — only for projects with no recent activity. Deleting these
+# from a live project is not a data-loss bug (they regenerate) but it silently
+# breaks the next build, which is how this was found: three repos lost their
+# deps mid-session while agents were working in them.
+echo "📦 Node.js caches (node_modules, .next) — projects idle >$NODE_MODULES_AGE_DAYS days..."
 for project in "$PROJECT_DIR"/*; do
     [ -d "$project" ] || continue
+    [ -d "$project/node_modules" ] || [ -d "$project/.next" ] || continue
+
+    pname="$(basename "$project")"
+
+    if has_recent_project_activity "$project" $NODE_MODULES_AGE_DAYS; then
+        echo "  [KEEP recent activity] $pname"
+        continue
+    fi
+
+    if has_open_handles "$project"; then
+        echo "  [SKIP open handles] $pname"
+        continue
+    fi
 
     if [ -d "$project/node_modules" ]; then
         remove_item "$project/node_modules" "node_modules"

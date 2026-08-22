@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`node_modules` and `.next` are no longer deleted from active projects.**
+  They were the only per-project category with no age threshold and no
+  active-worktree check — every sibling (Python caches, venvs, Rust `target/`)
+  had both, and the README already promised age thresholds for all of them.
+  In practice `clean` removed the dependencies of repos that were being worked
+  in at that moment, three times in one eight-hour session; nothing is lost
+  permanently, but the next build fails and the cause is not obvious from the
+  failure.
+
+  The test is deliberately applied to the **project**, not to the artifact.
+  `node_modules`' own mtime is stamped at install time and is never bumped by
+  use, so "is `node_modules` old?" answers the wrong question — a tree
+  installed months ago and built against hourly looks stale. `clean` now asks
+  whether the project has been touched within `NODE_MODULES_AGE_DAYS` (default
+  7, matching `VENV_AGE_DAYS`/`TARGET_AGE_DAYS`), scanning recursively with the
+  heavy artifact dirs pruned and `.git` deliberately left in, since commits and
+  fetches are activity. Projects with open file handles are skipped as well.
+  Idle projects are still cleaned, and both decisions are now reported in
+  `--check` output.
+
 ## [0.3.0] - 2026-07-08
 
 Stops every known path by which `clean` could delete active work-in-progress
