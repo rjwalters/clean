@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Projects that other programs run in place keep their artifacts.** An MCP
+  server is often launched straight from a project checkout (`node
+  ~/GitHub/squad/dist/index.js`), so that project's `node_modules/` is a
+  runtime dependency, not a cache. Neither existing gate can see this: a
+  running server holds no open handle on modules it has already loaded, and
+  the project it runs from may sit unedited for weeks. Losing it took down the
+  squad MCP for every agent on the machine, twice in one week. `clean` now
+  finds these projects from the MCP configs (Claude Code user and per-project
+  `~/.claude.json`, each project's `.mcp.json` including env-var paths,
+  Claude Desktop, Cursor, Codex `[mcp_servers.*]`), from CLIs symlinked into a
+  bin directory or the global `node_modules` (`npm link`), from Loom's
+  `clean.keepBuildArtifacts`, and from `CLEAN_KEEP_PROJECTS`. The
+  `node_modules`/`.next`, venv, Rust `target/` and Gradle passes all skip them,
+  and each run prints the list with the reason for each. Without `python3`, the
+  JSON configs fall back to a string scan, except `~/.claude.json`, which also
+  lists every project ever opened and so is skipped rather than over-matched.
+
 ### Fixed
 
 - **`node_modules` and `.next` are no longer deleted from active projects.**

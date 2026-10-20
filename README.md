@@ -47,6 +47,15 @@ Cleans system caches, Docker resources, per-project build artifacts, and stale w
    registered worktrees are removed via `git worktree remove` (no `--force`, no
    `rm -rf` fallback), so git can veto if state changed since the safety checks
 7. **Pattern matching** — only known cache/temp patterns, never source code
+8. **Runtime projects** — a project that another program runs in place keeps
+   its `node_modules`, `target/`, venvs and `build/` whatever their age. That
+   covers MCP servers named in `~/.claude.json` (user and per-project),
+   every project's `.mcp.json`, Claude Desktop, Cursor and Codex
+   `[mcp_servers.*]`; CLIs symlinked into `~/.local/bin`, `~/bin`,
+   Homebrew's `bin` or the global `node_modules` (`npm link`); and workspaces
+   that set Loom's `clean.keepBuildArtifacts`. Neither the age test nor `lsof`
+   can see this dependency: a running MCP server holds no open handle on
+   modules it has already loaded. Add others with `CLEAN_KEEP_PROJECTS`
 
 ## Install
 
@@ -99,6 +108,14 @@ Edit the variables at the top of `cleanup.sh`:
 | `WORKTREE_AGE_DAYS` | `14` | Min idle time (recursive) before cleaning agent worktrees |
 | `PYCACHE_AGE_DAYS` | `14` | Min age before cleaning Python caches |
 | `TARGET_AGE_DAYS` | `7` | Min age before cleaning Rust target dirs |
+
+To keep a project's artifacts that detection misses, set
+`CLEAN_KEEP_PROJECTS=name1:name2` (top-level names under the project
+directory). Each run lists the runtime projects it found and why, under
+"Runtime projects".
+
+Tests: `/bin/bash tests/test-runtime-projects.sh` (hermetic: throwaway `HOME` and
+project dir).
 
 ## Worktree workflow
 
