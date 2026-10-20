@@ -18,6 +18,8 @@
 #      registered worktrees removed via `git worktree remove` (no --force,
 #      no rm -rf fallback) so git can veto if state changed under us
 #   7. Pattern matching — only known cache/temp patterns, never source
+#   8. Runtime projects — a project an MCP config, a linked CLI or Loom's
+#      clean.keepBuildArtifacts says is run in place keeps all its artifacts
 
 set -e
 
@@ -95,6 +97,9 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "  • GitHub issue status check (only cleans issue worktrees for CLOSED issues)"
     echo "  • Tool-native commands when possible (cargo clean, uv cache prune);"
     echo "    registered worktrees removed via git worktree remove, never rm -rf"
+    echo "  • Runtime projects (MCP servers in Claude/Codex/Cursor configs, CLIs"
+    echo "    linked onto PATH or npm-linked, Loom keepBuildArtifacts) keep their"
+    echo "    node_modules, target/, venvs and build/ regardless of age"
     echo ""
     echo "Options:"
     echo "  -h, --help         Show this help message"
@@ -106,6 +111,8 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "Environment:"
     echo "  CLEAN_PROJECT_DIR  Override project directory (default: auto-detect"
     echo "                     ~/GitHub, ~/Projects, ~/repos, ~/src)"
+    echo "  CLEAN_KEEP_PROJECTS  Colon-separated project names whose artifacts"
+    echo "                     are never cleaned (e.g. squad:my-mcp-server)"
     echo ""
     echo "Examples:"
     echo "  clean                              # Run cleanup"
@@ -301,6 +308,189 @@ is_in_active_worktree() {
         esac
     done <<< "$ACTIVE_WORKTREES"
     return 1
+}
+
+# Projects whose build output another program RUNS IN PLACE: an MCP server an
+# agent config launches by path, a CLI linked onto PATH or into the global
+# node_modules (`npm link`), or a workspace that sets Loom's
+# `clean.keepBuildArtifacts`. Their node_modules/, target/, venvs and build/
+# are runtime, not cache, and neither the age test nor lsof can see that: an
+# MCP server holds no open handle on a module it has already loaded, and the
+# project it runs from may not be edited for weeks. Deleting them broke the
+# squad MCP for every agent on the machine (2026-10-15 and 2026-10-19), so
+# each per-project artifact pass skips these projects outright.
+#
+# One line per project: "<project-name><TAB><why>".
+RUNTIME_PROJECTS=""
+
+# Resolve a symlink one hop to an absolute physical path (macOS readlink has no
+# portable -f before 12.3, so do it by hand).
+resolve_link() {
+    local link="$1" target
+    target="$(readlink "$link" 2>/dev/null)" || return 1
+    case "$target" in
+        /*) ;;
+        *) target="$(dirname "$link")/$target" ;;
+    esac
+    local dir
+    dir="$(cd "$(dirname "$target")" 2>/dev/null && pwd -P)" || { echo "$target"; return 0; }
+    echo "$dir/$(basename "$target")"
+}
+
+# Print the MCP server paths (command, args, env values) from every
+# `mcpServers` object in a JSON file, one per line. Relative paths are resolved
+# against $2 (the directory the config applies to); for ~/.claude.json a
+# per-project server resolves against that project's key instead. Needs
+# python3; without it the caller falls back to a plain string scan.
+mcp_json_paths() {
+    local file="$1" base="$2"
+    python3 - "$file" "$base" <<'PY' 2>/dev/null
+import json, os, sys
+path, base = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(path))
+except Exception:
+    sys.exit(1)
+def strings(server):
+    vals = [server.get("command")] + list(server.get("args") or [])
+    vals += list((server.get("env") or {}).values())
+    return [v for v in vals if isinstance(v, str)]
+def walk(node, here):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "mcpServers" and isinstance(v, dict):
+                for server in v.values():
+                    if isinstance(server, dict):
+                        for s in strings(server):
+                            if s.startswith(("./", "../")):
+                                print(os.path.normpath(os.path.join(here, s)))
+                            elif s.startswith("/"):
+                                print(s)
+            else:
+                walk(v, k if k.startswith("/") and isinstance(v, dict) else here)
+    elif isinstance(node, list):
+        for v in node:
+            walk(v, here)
+walk(data, base)
+PY
+}
+
+# Prefix each non-empty stdin line with "$1<TAB>" (BSD sed has no \t).
+tag_lines() {
+    local p
+    while IFS= read -r p; do
+        [ -n "$p" ] && printf '%s\t%s\n' "$1" "$p"
+    done
+    return 0
+}
+
+discover_runtime_projects() {
+    [ -n "$PROJECT_DIR" ] || return
+    local root
+    root="$(cd "$PROJECT_DIR" 2>/dev/null && pwd -P)" || return
+    local have_py=false
+    python3 -c 'pass' >/dev/null 2>&1 && have_py=true
+
+    local candidates=""
+    local cfg proj
+    # MCP configs: Claude Code (user + per-project), Claude Desktop, Cursor, and
+    # every project's own .mcp.json.
+    for cfg in "$HOME/.claude.json" \
+               "$HOME/Library/Application Support/Claude/claude_desktop_config.json" \
+               "$HOME/.cursor/mcp.json"; do
+        [ -f "$cfg" ] || continue
+        if [ "$have_py" = true ]; then
+            candidates+="$(mcp_json_paths "$cfg" "$HOME" | tag_lines mcp)"$'\n'
+        elif [ "$cfg" != "$HOME/.claude.json" ]; then
+            # Whole-file scan is only safe where the file holds nothing but MCP
+            # config; ~/.claude.json also lists every project ever opened.
+            candidates+="$(grep -oE '"/[^"]+"' "$cfg" | tr -d '"' | tag_lines mcp)"$'\n'
+        fi
+    done
+    for proj in "$PROJECT_DIR"/*/; do
+        cfg="${proj}.mcp.json"
+        [ -f "$cfg" ] || continue
+        proj="$(cd "$proj" && pwd -P)"
+        if [ "$have_py" = true ]; then
+            candidates+="$(mcp_json_paths "$cfg" "$proj" | tag_lines mcp)"$'\n'
+        else
+            candidates+="$(grep -oE '"(/|\.\.?/)[^"]+"' "$cfg" | tr -d '"' \
+                | while read -r p; do
+                      case "$p" in
+                          /*) echo "$p" ;;
+                          *) d="$(cd "$proj/$(dirname "$p")" 2>/dev/null && pwd -P)" \
+                                 && echo "$d/$(basename "$p")" ;;
+                      esac
+                  done \
+                | tag_lines mcp)"$'\n'
+        fi
+    done
+    # Codex: only lines inside [mcp_servers.*] tables (the rest of config.toml
+    # names trusted projects, which are not runtimes).
+    if [ -f "$HOME/.codex/config.toml" ]; then
+        candidates+="$(awk '/^\[/ { in_mcp = ($0 ~ /^\[mcp_servers[].]/) } in_mcp' "$HOME/.codex/config.toml" \
+            | grep -oE '"/[^"]+"' | tr -d '"' | tag_lines mcp)"$'\n'
+    fi
+    # CLIs run in place: symlinks on PATH-like dirs and in the global
+    # node_modules (`npm link`) that point into a project.
+    local bindir link target npm_root=""
+    command -v npm >/dev/null 2>&1 && npm_root="$(npm root -g 2>/dev/null)"
+    for bindir in "$HOME/.local/bin" "$HOME/bin" /opt/homebrew/bin /usr/local/bin \
+                  ${npm_root:+"$npm_root"} ${npm_root:+"$npm_root"/@*}; do
+        [ -d "$bindir" ] || continue
+        # One stat per directory (Homebrew's bin holds thousands of links);
+        # only targets that mention the project dir's name are resolved.
+        while IFS=$'\t' read -r link target; do
+            case "$target" in
+                *"/${root##*/}/"*|*"/${PROJECT_DIR##*/}/"*) ;;
+                *) continue ;;
+            esac
+            target="$(resolve_link "$link")" || continue
+            candidates+="$(echo "$target" | tag_lines linked)"$'\n'
+        done < <(find "$bindir" -maxdepth 1 -type l -exec stat -f '%N%t%Y' {} + 2>/dev/null)
+    done
+    # Loom's per-workspace opt-out, honoured here too so both cleaners agree.
+    for proj in "$PROJECT_DIR"/*/; do
+        if cat "${proj}.loom/config.json" "${proj}".loom-local/*.json 2>/dev/null \
+            | grep -qE '"keepBuildArtifacts"[[:space:]]*:[[:space:]]*true'; then
+            candidates+="$(echo "${proj%/}" | tag_lines keepBuildArtifacts)"$'\n'
+        fi
+    done
+    # Explicit keeps: CLEAN_KEEP_PROJECTS=name1:name2
+    local name
+    for name in $(echo "${CLEAN_KEEP_PROJECTS:-}" | tr ':' ' '); do
+        candidates+="$(echo "$PROJECT_DIR/$name" | tag_lines CLEAN_KEEP_PROJECTS)"$'\n'
+    done
+
+    # Map each path to the top-level project it lives in.
+    local why path rel
+    while IFS=$'\t' read -r why path; do
+        [ -n "$path" ] || continue
+        case "$path" in
+            "$root"/*) rel="${path#"$root"/}" ;;
+            "$PROJECT_DIR"/*) rel="${path#"$PROJECT_DIR"/}" ;;
+            *) continue ;;
+        esac
+        name="${rel%%/*}"
+        [ -n "$name" ] && [ -d "$PROJECT_DIR/$name" ] || continue
+        case $'\n'"$RUNTIME_PROJECTS" in
+            *$'\n'"$name"$'\t'*) continue ;;
+        esac
+        RUNTIME_PROJECTS+="$name"$'\t'"$why"$'\n'
+    done <<< "$candidates"
+}
+
+# Print why $1 (a path at or under a top-level project) is a runtime project,
+# and return 0; return 1 if it is not one.
+runtime_project_reason() {
+    local path="$1" rel name
+    rel="${path#"$PROJECT_DIR"/}"
+    [ "$rel" != "$path" ] || return 1
+    name="${rel%%/*}"
+    local line
+    line="$(printf '%s' "$RUNTIME_PROJECTS" | awk -F'\t' -v n="$name" '$1 == n { print $2; exit }')"
+    [ -n "$line" ] || return 1
+    echo "$line"
 }
 
 # Remove or report removal of a file/directory
@@ -558,6 +748,19 @@ echo "              PROJECT CLEANUP ($PROJECT_DIR)"
 echo "═══════════════════════════════════════════════════════════"
 echo ""
 
+# Projects other programs run in place (MCP servers, linked CLIs): every
+# artifact pass below leaves them alone.
+discover_runtime_projects
+echo "🔌 Runtime projects (MCP servers, linked CLIs, keepBuildArtifacts) — artifacts kept:"
+if [ -n "$RUNTIME_PROJECTS" ]; then
+    printf '%s' "$RUNTIME_PROJECTS" | while IFS=$'\t' read -r name why; do
+        echo "  [KEEP runtime: $why] $name"
+    done
+else
+    echo "  (none found)"
+fi
+echo ""
+
 # Node.js caches — only for projects with no recent activity. Deleting these
 # from a live project is not a data-loss bug (they regenerate) but it silently
 # breaks the next build, which is how this was found: three repos lost their
@@ -568,6 +771,10 @@ for project in "$PROJECT_DIR"/*; do
     [ -d "$project/node_modules" ] || [ -d "$project/.next" ] || continue
 
     pname="$(basename "$project")"
+
+    if runtime_project_reason "$project" >/dev/null; then
+        continue
+    fi
 
     if has_recent_project_activity "$project" $NODE_MODULES_AGE_DAYS; then
         echo "  [KEEP recent activity] $pname"
@@ -625,6 +832,7 @@ find "$PROJECT_DIR" \
         continue
     fi
     if is_in_active_worktree "$venv_path"; then continue; fi
+    if runtime_project_reason "$venv_path" >/dev/null; then continue; fi
     if ! is_older_than_days "$venv_path" $VENV_AGE_DAYS; then
         last_mod=$(stat -f "%Sm" -t "%Y-%m-%d" "$venv_path" 2>/dev/null || echo "unknown")
         echo "  [KEEPING] $venv_path (last modified: $last_mod)"
@@ -647,6 +855,7 @@ find "$PROJECT_DIR" \
         [ -d "$target_dir" ] || continue
 
         if is_in_active_worktree "$target_dir"; then continue; fi
+        if runtime_project_reason "$target_dir" >/dev/null; then continue; fi
         if ! is_older_than_days "$target_dir" $TARGET_AGE_DAYS; then continue; fi
 
         size=$(get_size "$target_dir")
@@ -666,6 +875,7 @@ echo ""
 echo "☕ Java/Kotlin build caches (build/, .gradle/)..."
 for project in "$PROJECT_DIR"/*; do
     [ -d "$project" ] || continue
+    runtime_project_reason "$project" >/dev/null && continue
 
     if [ -d "$project/build" ] && [ -f "$project/build.gradle" -o -f "$project/build.gradle.kts" ]; then
         remove_item "$project/build" "Gradle build"
