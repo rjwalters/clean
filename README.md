@@ -114,7 +114,7 @@ To keep a project's artifacts that detection misses, set
 directory). Each run lists the runtime projects it found and why, under
 "Runtime projects".
 
-Tests: `bash tests/test-runtime-projects.sh` (hermetic: throwaway `HOME` and
+Tests: `/bin/bash tests/test-runtime-projects.sh` (hermetic: throwaway `HOME` and
 project dir).
 
 ## Worktree workflow

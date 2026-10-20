@@ -3,7 +3,10 @@
 # CLIs, keepBuildArtifacts and CLEAN_KEEP_PROJECTS protect a project's
 # artifacts; trusted-project lists and unrelated paths do not.
 #
-#   bash tests/test-runtime-projects.sh
+#   /bin/bash tests/test-runtime-projects.sh
+#
+# Run it with /bin/bash (3.2 on macOS), the shell cleanup.sh actually runs
+# under: bash 5 accepts syntax 3.2 rejects.
 #
 # Hermetic: a throwaway HOME and project dir; only the detection functions are
 # loaded from cleanup.sh, so nothing on this machine is scanned or removed.
@@ -81,6 +84,14 @@ expect "no python3: .mcp.json still scanned"        "$(why squad)"      mcp
 expect "no python3: ~/.claude.json skipped"         "$(why loomish)"    -
 expect "no python3: Codex still scanned"            "$(why codexsrv)"   mcp
 unset -f python3
+
+# Under set -e, as in cleanup.sh, detection must never abort the run.
+survives() { (set -e; "$@"; discover_runtime_projects; echo survived) 2>/dev/null | tail -1; }
+failing_npm() { npm() { return 1; }; }
+missing_dir() { PROJECT_DIR="$TMP/no-such-dir"; }
+expect "set -e: failing 'npm root -g' does not abort" "$(survives failing_npm)" survived
+expect "set -e: missing project dir does not abort"  "$(survives missing_dir)" survived
+expect "set -e: no python3 does not abort" "$(survives eval 'python3() { return 127; }')" survived
 
 echo
 echo "$FAILS failure(s)"

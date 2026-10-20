@@ -375,6 +375,21 @@ walk(data, base)
 PY
 }
 
+# Make each stdin path absolute against $1 (relative paths are resolved
+# physically, so "../squad/x" lands in squad, not in $1). A helper rather than
+# an inline loop: bash 3.2 cannot parse an unbalanced case pattern inside $(...).
+absolutize_paths() {
+    local base="$1" p d
+    while IFS= read -r p; do
+        case "$p" in
+            (/*) echo "$p" ;;
+            (*) d="$(cd "$base/$(dirname "$p")" 2>/dev/null && pwd -P)" || continue
+                echo "$d/$(basename "$p")" ;;
+        esac
+    done
+    return 0
+}
+
 # Prefix each non-empty stdin line with "$1<TAB>" (BSD sed has no \t).
 tag_lines() {
     local p
@@ -385,11 +400,16 @@ tag_lines() {
 }
 
 discover_runtime_projects() {
-    [ -n "$PROJECT_DIR" ] || return
+    [ -n "$PROJECT_DIR" ] || return 0
     local root
-    root="$(cd "$PROJECT_DIR" 2>/dev/null && pwd -P)" || return
+    root="$(cd "$PROJECT_DIR" 2>/dev/null && pwd -P)" || return 0
     local have_py=false
-    python3 -c 'pass' >/dev/null 2>&1 && have_py=true
+    # /usr/bin/python3 is a stub that pops the Command Line Tools installer
+    # when they are missing; only probe it when they are present.
+    if [ "$(command -v python3 2>/dev/null)" != /usr/bin/python3 ] \
+        || xcode-select -p >/dev/null 2>&1; then
+        python3 -c 'pass' >/dev/null 2>&1 && have_py=true
+    fi
 
     local candidates=""
     local cfg proj
@@ -415,14 +435,7 @@ discover_runtime_projects() {
             candidates+="$(mcp_json_paths "$cfg" "$proj" | tag_lines mcp)"$'\n'
         else
             candidates+="$(grep -oE '"(/|\.\.?/)[^"]+"' "$cfg" | tr -d '"' \
-                | while read -r p; do
-                      case "$p" in
-                          /*) echo "$p" ;;
-                          *) d="$(cd "$proj/$(dirname "$p")" 2>/dev/null && pwd -P)" \
-                                 && echo "$d/$(basename "$p")" ;;
-                      esac
-                  done \
-                | tag_lines mcp)"$'\n'
+                | absolutize_paths "$proj" | tag_lines mcp)"$'\n'
         fi
     done
     # Codex: only lines inside [mcp_servers.*] tables (the rest of config.toml
@@ -434,7 +447,9 @@ discover_runtime_projects() {
     # CLIs run in place: symlinks on PATH-like dirs and in the global
     # node_modules (`npm link`) that point into a project.
     local bindir link target npm_root=""
-    command -v npm >/dev/null 2>&1 && npm_root="$(npm root -g 2>/dev/null)"
+    if command -v npm >/dev/null 2>&1; then
+        npm_root="$(npm root -g 2>/dev/null)" || npm_root=""
+    fi
     for bindir in "$HOME/.local/bin" "$HOME/bin" /opt/homebrew/bin /usr/local/bin \
                   ${npm_root:+"$npm_root"} ${npm_root:+"$npm_root"/@*}; do
         [ -d "$bindir" ] || continue
@@ -750,7 +765,9 @@ echo ""
 
 # Projects other programs run in place (MCP servers, linked CLIs): every
 # artifact pass below leaves them alone.
-discover_runtime_projects
+# `|| true` also turns set -e off inside it: a detection failure means less
+# protection reported, never an aborted cleanup.
+discover_runtime_projects || true
 echo "🔌 Runtime projects (MCP servers, linked CLIs, keepBuildArtifacts) — artifacts kept:"
 if [ -n "$RUNTIME_PROJECTS" ]; then
     printf '%s' "$RUNTIME_PROJECTS" | while IFS=$'\t' read -r name why; do
